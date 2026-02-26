@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand:        #d5006c;
+  --color-brand-dark:   #b0005a;
+  --color-brand-light:  #fce7f3;
+  --color-brand-border: #f9a8d4;
+}
+
+:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: #f1f5f9;
+}
