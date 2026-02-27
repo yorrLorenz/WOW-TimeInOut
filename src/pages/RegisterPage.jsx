@@ -3,7 +3,7 @@ import { useBranch } from '../context/BranchContext';
 import { useCamera } from '../hooks/useCamera';
 import CameraView from '../components/CameraView';
 import { loadModels, detectSingleFaceDescriptor, descriptorToArray } from '../lib/faceApi';
-import { saveEmployee, getAllEmployees, getAllBranches } from '../lib/db';
+import { registerEmployee, getAllEmployees, getAllBranches } from '../lib/db';
 
 const CAPTURE_COUNT = 5; // number of samples per registration
 
@@ -62,10 +62,26 @@ export default function RegisterPage() {
     }
     setCaptures(newCaptures);
     if (newCaptures.length >= 3) {
-      setStatus(`Captured ${newCaptures.length} samples. Click "Save Employee" to register.`);
+      setStatus(`Captured ${newCaptures.length} samples. You can add more samples (e.g. with glasses) or click "Save Employee".`);
     } else {
       setStatus(`Only ${newCaptures.length} samples captured. Try again with better lighting.`);
     }
+    setCapturing(false);
+  }
+
+  async function handleCaptureMore() {
+    setCapturing(true);
+    setStatus('Capturing additional samples…');
+    const extra = [];
+    for (let i = 0; i < CAPTURE_COUNT; i++) {
+      setStatus(`Capturing additional sample ${i + 1} of ${CAPTURE_COUNT}…`);
+      await new Promise((r) => setTimeout(r, 600));
+      const desc = await captureDescriptor();
+      if (desc) extra.push(desc);
+    }
+    const total = captures.length + extra.length;
+    setCaptures((prev) => [...prev, ...extra]);
+    setStatus(`Total: ${total} samples captured. Click "Save Employee" to register.`);
     setCapturing(false);
   }
 
@@ -74,7 +90,7 @@ export default function RegisterPage() {
     if (captures.length < 3) { setStatus('Please capture at least 3 face samples.'); return; }
     setSaving(true);
     try {
-      await saveEmployee({
+      await registerEmployee({
         name: name.trim(),
         position: position.trim(),
         homeBranch: branch.isAdmin ? null : branch.code,
@@ -114,28 +130,31 @@ export default function RegisterPage() {
               placeholder="Full Name *"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
             />
             <input
               type="text"
               placeholder="Position / Role"
               value={position}
               onChange={(e) => setPosition(e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
             />
           </div>
 
           {/* Capture progress */}
           {captures.length > 0 && (
-            <div className="flex gap-1">
-              {Array.from({ length: CAPTURE_COUNT }).map((_, i) => (
-                <div
-                  key={i}
-                  className={`h-2 flex-1 rounded-full ${
-                    i < captures.length ? 'bg-blue-500' : 'bg-gray-200'
-                  }`}
-                />
-              ))}
+            <div className="space-y-1">
+              <div className="flex gap-1">
+                {Array.from({ length: Math.max(captures.length, CAPTURE_COUNT) }).map((_, i) => (
+                  <div
+                    key={i}
+                    className={`h-2 flex-1 rounded-full ${
+                      i < captures.length ? 'bg-brand' : 'bg-gray-200'
+                    }`}
+                  />
+                ))}
+              </div>
+              <p className="text-xs text-gray-400 text-right">{captures.length} samples</p>
             </div>
           )}
 
@@ -147,11 +166,11 @@ export default function RegisterPage() {
 
           <div className="flex gap-2">
             <button
-              onClick={handleCapture}
+              onClick={captures.length === 0 ? handleCapture : handleCaptureMore}
               disabled={capturing || !ready || !modelsReady}
-              className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded-lg text-sm transition-colors disabled:opacity-60"
+              className="flex-1 bg-brand hover:bg-brand-dark text-white font-semibold py-2 rounded-lg text-sm transition-colors disabled:opacity-60"
             >
-              {capturing ? 'Capturing…' : 'Capture Face'}
+              {capturing ? 'Capturing…' : captures.length === 0 ? 'Capture Face' : '+ More Samples'}
             </button>
             <button
               onClick={handleSave}
@@ -161,6 +180,12 @@ export default function RegisterPage() {
               {saving ? 'Saving…' : 'Save Employee'}
             </button>
           </div>
+
+          {captures.length >= 3 && (
+            <p className="text-xs text-gray-400 text-center">
+              Tip: capture again with/without glasses or a different angle to improve recognition accuracy.
+            </p>
+          )}
 
           {!modelsReady && (
             <p className="text-xs text-gray-400 text-center">Loading face recognition models…</p>
@@ -198,15 +223,15 @@ export default function RegisterPage() {
                 .filter((e) => branchFilter === 'ALL' || e.homeBranch === branchFilter)
                 .map((emp) => (
                   <li key={emp.id} className="px-4 py-3 flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-sm shrink-0">
+                    <div className="w-8 h-8 rounded-full bg-brand-light flex items-center justify-center text-brand font-bold text-sm shrink-0">
                       {emp.name[0].toUpperCase()}
                     </div>
                     <div className="min-w-0">
                       <p className="font-medium text-gray-800 text-sm truncate">{emp.name}</p>
                       <p className="text-xs text-gray-500">
                         {emp.position || 'No position'} &bull; {emp.descriptors?.length ?? 0} samples
-                        {emp.homeBranch && (
-                          <span className="ml-1 text-gray-400">({emp.homeBranch})</span>
+                        {emp.uid && (
+                          <span className="ml-1 font-mono text-brand">{emp.uid}</span>
                         )}
                       </p>
                     </div>

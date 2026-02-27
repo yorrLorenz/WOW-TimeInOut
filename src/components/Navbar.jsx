@@ -11,7 +11,7 @@ export default function Navbar() {
   }
 
   return (
-    <nav className="bg-blue-700 text-white px-6 py-3 flex items-center justify-between shadow-md">
+    <nav className="bg-brand text-white px-6 py-3 flex items-center justify-between shadow-md">
       <div className="flex items-center gap-3">
         <span className="font-bold text-lg tracking-wide">TimeIn</span>
         {branch && (
@@ -19,7 +19,7 @@ export default function Navbar() {
             className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
               branch.isAdmin
                 ? 'bg-amber-400 text-amber-900'
-                : 'bg-blue-500 text-white'
+                : 'bg-brand-dark text-white'
             }`}
           >
             {branch.isAdmin ? 'ADMIN' : branch.code}
@@ -31,27 +31,27 @@ export default function Navbar() {
         <div className="flex items-center gap-4 text-sm">
           {branch.isAdmin ? (
             <>
-              <Link to="/dashboard" className="hover:text-blue-200 transition-colors">
+              <Link to="/dashboard" className="hover:text-white/70 transition-colors">
                 Dashboard
               </Link>
-              <Link to="/timeinout" className="hover:text-blue-200 transition-colors">
+              <Link to="/timeinout" className="hover:text-white/70 transition-colors">
                 Time In/Out
               </Link>
-              <Link to="/register" className="hover:text-blue-200 transition-colors">
+              <Link to="/register" className="hover:text-white/70 transition-colors">
                 Register
               </Link>
-              <Link to="/admin" className="hover:text-blue-200 transition-colors">
+              <Link to="/admin" className="hover:text-white/70 transition-colors">
                 Admin
               </Link>
             </>
           ) : (
-            <Link to="/timeinout" className="hover:text-blue-200 transition-colors">
+            <Link to="/timeinout" className="hover:text-white/70 transition-colors">
               Time In/Out
             </Link>
           )}
           <button
             onClick={handleLogout}
-            className="bg-white text-blue-700 px-3 py-1 rounded font-semibold hover:bg-blue-50 transition-colors"
+            className="bg-white text-brand px-3 py-1 rounded font-semibold hover:bg-brand-light transition-colors"
           >
             Logout
           </button>

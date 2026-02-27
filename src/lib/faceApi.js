@@ -50,6 +50,29 @@ export function descriptorToArray(descriptor) {
 }
 
 /**
+ * Detect a single face with landmarks only (no descriptor) — faster, for liveness checks.
+ * Returns null if no face detected.
+ */
+export async function detectFaceWithLandmarks(mediaElement) {
+  const result = await faceapi
+    .detectSingleFace(mediaElement, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
+    .withFaceLandmarks();
+  return result ?? null;
+}
+
+/**
+ * Calculate the average Eye Aspect Ratio (EAR) from face landmarks.
+ * EAR < 0.20 → eye closed (blink); EAR > 0.25 → eye open.
+ */
+export function calcEAR(landmarks) {
+  function eyeAR(eye) {
+    const d = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+    return (d(eye[1], eye[5]) + d(eye[2], eye[4])) / (2 * d(eye[0], eye[3]));
+  }
+  return (eyeAR(landmarks.getLeftEye()) + eyeAR(landmarks.getRightEye())) / 2;
+}
+
+/**
  * Draw detection results on a canvas overlaid on a video element.
  */
 export function drawDetections(canvas, videoEl, detections) {

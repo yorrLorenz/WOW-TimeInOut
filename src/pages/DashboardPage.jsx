@@ -8,6 +8,24 @@ import {
   todayDateString,
 } from '../lib/db';
 
+// ── ElapsedTime: live running clock for present employees ────────────────────
+
+function ElapsedTime({ timeIn }) {
+  function getElapsed() {
+    const ms = Date.now() - new Date(timeIn).getTime();
+    if (ms < 0) return '—';
+    const h = Math.floor(ms / 3_600_000);
+    const m = Math.floor((ms % 3_600_000) / 60_000);
+    return `${h}h ${m}m`;
+  }
+  const [elapsed, setElapsed] = useState(getElapsed);
+  useEffect(() => {
+    const t = setInterval(() => setElapsed(getElapsed()), 30_000);
+    return () => clearInterval(t);
+  }, [timeIn]);
+  return <span className="text-xs font-semibold text-brand">▶ {elapsed}</span>;
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 function formatTime(iso) {
@@ -42,7 +60,7 @@ function StatusBadge({ log }) {
 
 function StatCard({ label, value, color }) {
   const colors = {
-    blue: 'bg-blue-50 text-blue-700 border-blue-100',
+    brand: 'bg-brand-light text-brand border-brand-border',
     yellow: 'bg-yellow-50 text-yellow-700 border-yellow-100',
     green: 'bg-green-50 text-green-700 border-green-100',
   };
@@ -96,13 +114,13 @@ function BranchDashboard({ branch }) {
             {branch.name} &bull; {today}
           </p>
         </div>
-        <button onClick={load} className="text-sm text-blue-600 hover:text-blue-800 font-medium">
+        <button onClick={load} className="text-sm text-brand hover:text-brand-dark font-medium">
           Refresh
         </button>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
-        <StatCard label="Total Today" value={rows.length} color="blue" />
+        <StatCard label="Total Today" value={rows.length} color="brand" />
         <StatCard label="Present" value={present} color="yellow" />
         <StatCard label="Timed Out" value={out} color="green" />
       </div>
@@ -137,7 +155,12 @@ function BranchDashboard({ branch }) {
                     <td className="px-4 py-3 font-medium text-gray-800">{row.employeeName}</td>
                     <td className="px-4 py-3 text-gray-600">{formatTime(row.timeIn)}</td>
                     <td className="px-4 py-3 text-gray-600">{formatTime(row.timeOut)}</td>
-                    <td className="px-4 py-3 text-gray-500">{duration(row.timeIn, row.timeOut)}</td>
+                    <td className="px-4 py-3">
+                      {row.timeOut
+                        ? <span className="text-gray-500">{duration(row.timeIn, row.timeOut)}</span>
+                        : <ElapsedTime timeIn={row.timeIn} />
+                      }
+                    </td>
                     <td className="px-4 py-3">
                       <StatusBadge log={row} />
                     </td>
@@ -170,9 +193,9 @@ function BranchCard({ branch, logs }) {
         </span>
       </div>
       <div className="grid grid-cols-3 gap-2 mb-4 text-center">
-        <div className="bg-blue-50 rounded-lg p-2">
-          <p className="text-xs text-blue-600 font-medium">Total</p>
-          <p className="text-xl font-bold text-blue-700">{logs.length}</p>
+        <div className="bg-brand-light rounded-lg p-2">
+          <p className="text-xs text-brand font-medium">Total</p>
+          <p className="text-xl font-bold text-brand">{logs.length}</p>
         </div>
         <div className="bg-yellow-50 rounded-lg p-2">
           <p className="text-xs text-yellow-600 font-medium">Present</p>
@@ -269,7 +292,7 @@ function SuperAdminDashboard() {
           <select
             value={filterBranch}
             onChange={(e) => setFilterBranch(e.target.value)}
-            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
           >
             <option value="ALL">All Branches</option>
             {allBranches.map((b) => (
@@ -280,7 +303,7 @@ function SuperAdminDashboard() {
           </select>
           <button
             onClick={load}
-            className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+            className="text-sm text-brand hover:text-brand-dark font-medium"
           >
             Refresh
           </button>
@@ -289,7 +312,7 @@ function SuperAdminDashboard() {
 
       {/* Global stats */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
-        <StatCard label="Total Today" value={visibleLogs.length} color="blue" />
+        <StatCard label="Total Today" value={visibleLogs.length} color="brand" />
         <StatCard label="Present" value={present} color="yellow" />
         <StatCard label="Timed Out" value={timedOut} color="green" />
       </div>

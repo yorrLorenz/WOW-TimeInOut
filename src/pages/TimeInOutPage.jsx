@@ -4,6 +4,7 @@ import { useCamera } from '../hooks/useCamera';
 import CameraView from '../components/CameraView';
 import {
   loadModels,
+  detectFaceWithLandmarks,
   detectSingleFaceDescriptor,
   buildMatcher,
   drawDetections,
@@ -17,7 +18,56 @@ import {
 } from '../lib/db';
 import { pushLogToSheets, calcDuration } from '../lib/sheets';
 
-const SCAN_INTERVAL_MS = 800;
+const SCAN_INTERVAL_MS     = 100;
+
+// ── Gate 1: continuous pixel motion ──────────────────────────────────────────
+const MOTION_THRESHOLD     = 6.0;   // avg R-channel diff to count a frame as "motion"
+const STILL_THRESHOLD      = 1.0;   // below this → near-zero diff → static image → RESET presence
+const REQUIRED_LIVE_FRAMES = 15;    // ~1.5 s of unbroken motion at 100 ms intervals
+const FACE_SAMPLE_SIZE     = 50;
+
+// ── Gate 2: head-turn landmark geometry ──────────────────────────────────────
+// When the head turns, the nose moves closer to one eye.
+// Ratio = dist(noseTip → leftEye) / dist(noseTip → rightEye)
+//   Straight:    ≈ 1.0
+//   Turned:      < TURN_THRESHOLD  or  > 1/TURN_THRESHOLD
+// Moving a flat phone photo laterally does NOT change this internal ratio,
+// making this immune to the phone-tremor spoofing that defeated pixel diff.
+const TURN_THRESHOLD       = 0.78;  // 22% deviation from 1.0 = ~10–15° head turn
+const REQUIRED_TURN_FRAMES = 3;     // hold the turn for 3 consecutive frames (~300 ms)
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function captureFacePixels(videoEl, box, canvas) {
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(
+    videoEl,
+    box.x, box.y, box.width, box.height,
+    0, 0, FACE_SAMPLE_SIZE, FACE_SAMPLE_SIZE
+  );
+  return ctx.getImageData(0, 0, FACE_SAMPLE_SIZE, FACE_SAMPLE_SIZE).data;
+}
+
+function avgPixelDiff(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 4) sum += Math.abs(a[i] - b[i]);
+  return sum / (a.length / 4);
+}
+
+function getHeadTurnRatio(landmarks) {
+  const avg = pts => ({
+    x: pts.reduce((s, p) => s + p.x, 0) / pts.length,
+    y: pts.reduce((s, p) => s + p.y, 0) / pts.length,
+  });
+  const leftCenter  = avg(landmarks.getLeftEye());
+  const rightCenter = avg(landmarks.getRightEye());
+  const nose        = landmarks.getNose();
+  const noseTip     = nose[nose.length - 1];          // bottom of nose
+  const dist = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+  return dist(noseTip, leftCenter) / dist(noseTip, rightCenter);
+}
+
+// ── Page component ────────────────────────────────────────────────────────────
 
 export default function TimeInOutPage() {
   const { branch } = useBranch();
@@ -25,23 +75,39 @@ export default function TimeInOutPage() {
   const canvasRef = useRef(null);
 
   const [modelsReady, setModelsReady] = useState(false);
-  const [matcher, setMatcher] = useState(null);
-  const [employees, setEmployees] = useState([]);
-  const [scanning, setScanning] = useState(false);
-  const [message, setMessage] = useState('');
+  const [matcher, setMatcher]         = useState(null);
+  const [employees, setEmployees]     = useState([]);
+  const [scanning, setScanning]       = useState(false);
+  const [message, setMessage]         = useState('');
+  const [liveFrames, setLiveFrames]   = useState(0);    // Gate 1 progress
+  const [turnDone, setTurnDone]       = useState(false); // Gate 2 confirmed
 
-  // Confirmation state
-  const [pending, setPending] = useState(null);
-  // pending: { employee, proposedAction: 'Time In'|'Time Out'|'Already Complete', existingLog }
+  const [pending, setPending]         = useState(null);
+  const [lastResult, setLastResult]   = useState(null);
 
-  // Result state
-  const [lastResult, setLastResult] = useState(null);
-  // lastResult: { name, uid, action, time }
+  // Refs to avoid stale closures inside setInterval
+  const scanningRef       = useRef(false);
+  const intervalRef       = useRef(null);
+  const tickRunningRef    = useRef(false);
+  const matcherRef        = useRef(null);
+  const employeesRef      = useRef([]);
+  // Gate 1
+  const prevPixelsRef     = useRef(null);
+  const liveFrameCountRef = useRef(0);
+  const offscreenRef      = useRef(null);
+  // Gate 2
+  const turnFrameCountRef = useRef(0);
+  const turnDoneRef       = useRef(false);  // avoids redundant setTurnDone calls
 
-  const scanningRef = useRef(false);
-  const intervalRef = useRef(null);
+  useEffect(() => { matcherRef.current  = matcher;   }, [matcher]);
+  useEffect(() => { employeesRef.current = employees; }, [employees]);
 
   useEffect(() => {
+    const c = document.createElement('canvas');
+    c.width  = FACE_SAMPLE_SIZE;
+    c.height = FACE_SAMPLE_SIZE;
+    offscreenRef.current = c;
+
     async function init() {
       await loadModels();
       setModelsReady(true);
@@ -57,58 +123,139 @@ export default function TimeInOutPage() {
       const labeled = list
         .filter((e) => e.descriptors?.length > 0)
         .map((e) => ({ label: String(e.id), descriptors: e.descriptors }));
-      const m = buildMatcher(labeled, 0.5);
-      setMatcher(m);
+      setMatcher(buildMatcher(labeled, 0.55));
     }
   }
 
-  // ── Scan loop ──────────────────────────────────────────────────────────────
+  // ── Scan tick ────────────────────────────────────────────────────────────────
 
-  const runScan = useCallback(async () => {
-    if (!videoRef.current || !modelsReady || !matcher) return;
+  const scanTick = useCallback(async () => {
+    if (tickRunningRef.current || !videoRef.current || !modelsReady) return;
+    tickRunningRef.current = true;
+
     try {
-      const detection = await detectSingleFaceDescriptor(videoRef.current);
-      if (!detection) {
-        setMessage('Looking for a face…');
+      const faceDet = await detectFaceWithLandmarks(videoRef.current);
+
+      if (!faceDet) {
+        setMessage('Position your face in the camera frame…');
+        resetLiveness();
+        tickRunningRef.current = false;
         return;
       }
+
+      // ── Gate 1: pixel motion with stillness reset ─────────────────────────
+      const box = faceDet.detection.box;
+      const currentPixels = captureFacePixels(videoRef.current, box, offscreenRef.current);
+
+      if (prevPixelsRef.current) {
+        const diff = avgPixelDiff(currentPixels, prevPixelsRef.current);
+
+        if (diff < STILL_THRESHOLD) {
+          // Near-zero diff means a static image — reset presence counter
+          liveFrameCountRef.current = 0;
+          setLiveFrames(0);
+        } else if (diff > MOTION_THRESHOLD) {
+          liveFrameCountRef.current = Math.min(liveFrameCountRef.current + 1, REQUIRED_LIVE_FRAMES);
+          setLiveFrames(liveFrameCountRef.current);
+        }
+      }
+      prevPixelsRef.current = new Uint8ClampedArray(currentPixels);
+
+      // ── Gate 2: head-turn landmark ratio ──────────────────────────────────
+      if (!turnDoneRef.current) {
+        const ratio    = getHeadTurnRatio(faceDet.landmarks);
+        const isTurned = ratio < TURN_THRESHOLD || ratio > (1 / TURN_THRESHOLD);
+
+        if (isTurned) {
+          turnFrameCountRef.current = Math.min(turnFrameCountRef.current + 1, REQUIRED_TURN_FRAMES);
+        } else {
+          // Gradually release if they straighten — prevents counting a moment of jitter
+          turnFrameCountRef.current = Math.max(turnFrameCountRef.current - 1, 0);
+        }
+
+        if (turnFrameCountRef.current >= REQUIRED_TURN_FRAMES) {
+          turnDoneRef.current = true;
+          setTurnDone(true);
+        }
+      }
+
+      const presenceDone = liveFrameCountRef.current >= REQUIRED_LIVE_FRAMES;
+      const gate2Done    = turnDoneRef.current;
+
+      if (!presenceDone || !gate2Done) {
+        if (!presenceDone) {
+          setMessage('Look at the camera and hold still…');
+        } else {
+          setMessage('Turn your head slightly to either side…');
+        }
+        tickRunningRef.current = false;
+        return;
+      }
+
+      // ── Both gates passed — run full descriptor match ─────────────────────
+      setMessage('Identifying…');
+      const detection = await detectSingleFaceDescriptor(videoRef.current);
+
+      if (!detection) { tickRunningRef.current = false; return; }
+
       if (canvasRef.current) {
         drawDetections(canvasRef.current, videoRef.current, [detection]);
       }
-      const match = matcher.findBestMatch(detection.descriptor);
+
+      const m = matcherRef.current;
+      if (!m) { tickRunningRef.current = false; return; }
+
+      const match = m.findBestMatch(detection.descriptor);
+
       if (match.label === 'unknown') {
-        setMessage('Face not recognised. Please register first.');
+        setMessage('Face not recognised. Please try again or register.');
+        resetLiveness();
+        tickRunningRef.current = false;
         return;
       }
-      // Stop scan and show confirmation
+
       stopScan();
-      const emp = employees.find((e) => String(e.id) === match.label);
-      if (!emp) return;
+      const emp = employeesRef.current.find((e) => String(e.id) === match.label);
+      if (!emp) { tickRunningRef.current = false; return; }
+
       const existingLog = await getTodayLogForEmployee(emp.id);
       const proposedAction = !existingLog
         ? 'Time In'
         : !existingLog.timeOut
         ? 'Time Out'
         : 'Already Complete';
+
       setPending({ employee: emp, proposedAction, existingLog });
       setMessage('');
     } catch (err) {
       setMessage('Scan error: ' + err.message);
+    } finally {
+      tickRunningRef.current = false;
     }
-  }, [videoRef, modelsReady, matcher, employees]);
+  }, [videoRef, modelsReady]);
+
+  function resetLiveness() {
+    prevPixelsRef.current     = null;
+    liveFrameCountRef.current = 0;
+    turnFrameCountRef.current = 0;
+    turnDoneRef.current       = false;
+    setLiveFrames(0);
+    setTurnDone(false);
+  }
 
   function startScan() {
     if (scanningRef.current) return;
-    if (!matcher) {
+    if (!matcherRef.current) {
       setMessage('No registered employees. Please register employees first.');
       return;
     }
+    resetLiveness();
     setPending(null);
     setLastResult(null);
-    setMessage('Scanning…');
+    setMessage('Look at the camera and hold still…');
     scanningRef.current = true;
     setScanning(true);
-    intervalRef.current = setInterval(runScan, SCAN_INTERVAL_MS);
+    intervalRef.current = setInterval(scanTick, SCAN_INTERVAL_MS);
   }
 
   function stopScan() {
@@ -119,35 +266,35 @@ export default function TimeInOutPage() {
 
   useEffect(() => () => clearInterval(intervalRef.current), []);
 
-  // ── Confirmation handlers ──────────────────────────────────────────────────
+  // ── Confirmation handlers ─────────────────────────────────────────────────
 
   async function handleConfirm() {
     if (!pending) return;
     const { employee: emp, proposedAction, existingLog } = pending;
     const today = todayDateString();
-    const now = new Date().toISOString();
+    const now   = new Date().toISOString();
 
     if (proposedAction === 'Time In') {
       await addLog({
         employeeId: emp.id,
         branchCode: branch.code,
-        branchIn: branch.code,
-        branchOut: null,
-        date: today,
-        timeIn: now,
-        timeOut: null,
-        synced: false,
+        branchIn:   branch.code,
+        branchOut:  null,
+        date:       today,
+        timeIn:     now,
+        timeOut:    null,
+        synced:     false,
       });
       try {
         await pushLogToSheets({
           uid: emp.uid || `#${emp.id}`,
           employeeName: emp.name,
-          date: today,
-          timeIn: new Date(now).toLocaleTimeString(),
+          date:    today,
+          timeIn:  new Date(now).toLocaleTimeString(),
           timeOut: '',
-          branchIn: branch.code,
+          branchIn:  branch.code,
           branchOut: '',
-          duration: '',
+          duration:  '',
         });
       } catch {/* offline */}
     } else if (proposedAction === 'Time Out') {
@@ -157,21 +304,21 @@ export default function TimeInOutPage() {
         await pushLogToSheets({
           uid: emp.uid || `#${emp.id}`,
           employeeName: emp.name,
-          date: today,
-          timeIn: new Date(updatedLog.timeIn).toLocaleTimeString(),
-          timeOut: new Date(now).toLocaleTimeString(),
-          branchIn: updatedLog.branchIn ?? updatedLog.branchCode,
+          date:     today,
+          timeIn:   new Date(updatedLog.timeIn).toLocaleTimeString(),
+          timeOut:  new Date(now).toLocaleTimeString(),
+          branchIn:  updatedLog.branchIn ?? updatedLog.branchCode,
           branchOut: branch.code,
-          duration: calcDuration(updatedLog.timeIn, now),
+          duration:  calcDuration(updatedLog.timeIn, now),
         });
       } catch {/* offline */}
     }
 
     setLastResult({
-      name: emp.name,
-      uid: emp.uid || `#${emp.id}`,
+      name:   emp.name,
+      uid:    emp.uid || `#${emp.id}`,
       action: proposedAction,
-      time: new Date().toLocaleTimeString(),
+      time:   new Date().toLocaleTimeString(),
     });
     setPending(null);
   }
@@ -181,9 +328,11 @@ export default function TimeInOutPage() {
     startScan();
   }
 
-  const canScan = modelsReady && ready && !!matcher;
+  const canScan        = modelsReady && ready && !!matcher;
+  const presencePct    = Math.round((liveFrames / REQUIRED_LIVE_FRAMES) * 100);
+  const turnPct        = Math.round((turnFrameCountRef.current / REQUIRED_TURN_FRAMES) * 100);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -202,6 +351,48 @@ export default function TimeInOutPage() {
             error={error}
             className="aspect-video"
           />
+
+          {/* Liveness indicators */}
+          {scanning && (
+            <div className="space-y-2">
+              {/* Gate 1 */}
+              <div className="space-y-0.5">
+                <div className="flex items-center justify-between text-xs text-gray-500">
+                  <span>Presence</span>
+                  <span className={liveFrames >= REQUIRED_LIVE_FRAMES ? 'text-green-600 font-semibold' : ''}>
+                    {liveFrames >= REQUIRED_LIVE_FRAMES ? '✓ Ready' : `${presencePct}%`}
+                  </span>
+                </div>
+                <div className="w-full h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                  <div
+                    className="h-1.5 rounded-full transition-all duration-100"
+                    style={{
+                      width: `${presencePct}%`,
+                      backgroundColor: liveFrames >= REQUIRED_LIVE_FRAMES ? '#16a34a' : '#d5006c',
+                    }}
+                  />
+                </div>
+              </div>
+              {/* Gate 2 */}
+              <div className="space-y-0.5">
+                <div className="flex items-center justify-between text-xs text-gray-500">
+                  <span>Head turn  ← →</span>
+                  <span className={turnDone ? 'text-green-600 font-semibold' : 'text-gray-400'}>
+                    {turnDone ? '✓ Verified' : 'Turn head slightly'}
+                  </span>
+                </div>
+                <div className="w-full h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                  <div
+                    className="h-1.5 rounded-full transition-all duration-100"
+                    style={{
+                      width: turnDone ? '100%' : `${turnPct}%`,
+                      backgroundColor: turnDone ? '#16a34a' : '#d5006c',
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
 
           {message && (
             <p className="text-sm text-center text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
@@ -236,10 +427,10 @@ export default function TimeInOutPage() {
           )}
         </div>
 
-        {/* Right column: confirmation / result / roster */}
+        {/* Right column */}
         <div className="flex flex-col gap-4">
 
-          {/* ── Confirmation card ── */}
+          {/* Confirmation card */}
           {pending && (
             <div className="rounded-xl p-6 bg-white border-2 border-brand shadow-md text-center">
               <p className="text-xs font-semibold text-brand uppercase tracking-wide mb-3">
@@ -284,7 +475,7 @@ export default function TimeInOutPage() {
             </div>
           )}
 
-          {/* ── Result card ── */}
+          {/* Result card */}
           {!pending && lastResult && (
             <div className={`rounded-xl p-6 text-center shadow-sm ${
               lastResult.action === 'Time In'
@@ -317,15 +508,16 @@ export default function TimeInOutPage() {
             </div>
           )}
 
-          {/* ── Idle placeholder ── */}
+          {/* Idle placeholder */}
           {!pending && !lastResult && (
             <div className="rounded-xl p-6 bg-white border border-gray-100 shadow-sm text-center text-gray-400 text-sm">
               <div className="text-5xl mb-3">👤</div>
-              <p>Scan result will appear here.</p>
+              <p>Press <strong>Start Scan</strong> and look at the camera.</p>
+              <p className="text-xs mt-1 text-gray-300">Then turn your head slightly left or right.</p>
             </div>
           )}
 
-          {/* ── Employee roster ── */}
+          {/* Employee roster */}
           <div className="bg-white rounded-xl shadow-sm overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-100">
               <h2 className="text-sm font-semibold text-gray-700">Registered Employees</h2>
