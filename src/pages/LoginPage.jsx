@@ -149,7 +149,7 @@ export default function LoginPage() {
               onClick={() => setAccountCode(b.code)}
               className="block hover:text-brand transition-colors"
             >
-              {b.code} — {b.name}
+              {b.code} — {b.name} 
             </button>
           ))}
         </div>

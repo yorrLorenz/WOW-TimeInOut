@@ -4,6 +4,7 @@ import { useCamera } from '../hooks/useCamera';
 import CameraView from '../components/CameraView';
 import { loadModels, detectSingleFaceDescriptor, descriptorToArray } from '../lib/faceApi';
 import { registerEmployee, getAllEmployees, getAllBranches } from '../lib/db';
+import { upsertEmployeeToSheets } from '../lib/sheets';
 
 const CAPTURE_COUNT = 5; // number of samples per registration
 
@@ -90,18 +91,29 @@ export default function RegisterPage() {
     if (captures.length < 3) { setStatus('Please capture at least 3 face samples.'); return; }
     setSaving(true);
     try {
-      await registerEmployee({
-        name: name.trim(),
-        position: position.trim(),
+      const empData = {
+        name:       name.trim(),
+        position:   position.trim(),
         homeBranch: branch.isAdmin ? null : branch.code,
         descriptors: captures,
-        createdAt: new Date().toISOString(),
-      });
-      setStatus('Employee registered successfully!');
+        createdAt:  new Date().toISOString(),
+      };
+      const id  = await registerEmployee(empData);
+      const uid = `EMP-${String(id).padStart(4, '0')}`;
+
+      setStatus('Registered — syncing to Sheets…');
       setName('');
       setPosition('');
       setCaptures([]);
       await refreshEmployees();
+
+      // Push to EmployeeSync sheet so other branches can pull this employee's face data
+      try {
+        await upsertEmployeeToSheets({ ...empData, uid });
+        setStatus('Employee registered and synced to all branches.');
+      } catch {
+        setStatus('Employee registered. Sheets sync failed — use "Push All to Sync Sheet" in Settings.');
+      }
     } catch (err) {
       setStatus('Save failed: ' + err.message);
     } finally {

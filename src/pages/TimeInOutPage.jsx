@@ -16,7 +16,7 @@ import {
   saveLog,
   todayDateString,
 } from '../lib/db';
-import { pushLogToSheets, calcDuration } from '../lib/sheets';
+import { pushLogToSheets, updateLogInSheets, calcDuration } from '../lib/sheets';
 
 const SCAN_INTERVAL_MS     = 100;
 
@@ -274,6 +274,9 @@ export default function TimeInOutPage() {
     const today = todayDateString();
     const now   = new Date().toISOString();
 
+    let sheetsPayload = null;
+    let sheetsFn      = pushLogToSheets;   // 'add' for Time In, 'update' for Time Out
+
     if (proposedAction === 'Time In') {
       await addLog({
         employeeId: emp.id,
@@ -285,42 +288,51 @@ export default function TimeInOutPage() {
         timeOut:    null,
         synced:     false,
       });
-      try {
-        await pushLogToSheets({
-          uid: emp.uid || `#${emp.id}`,
-          employeeName: emp.name,
-          date:    today,
-          timeIn:  new Date(now).toLocaleTimeString(),
-          timeOut: '',
-          branchIn:  branch.code,
-          branchOut: '',
-          duration:  '',
-        });
-      } catch {/* offline */}
+      sheetsPayload = {
+        uid:          emp.uid || `#${emp.id}`,
+        employeeName: emp.name,
+        date:         today,
+        timeIn:       new Date(now).toLocaleTimeString(),
+        timeOut:      '',
+        branchIn:     branch.code,
+        branchOut:    '',
+        duration:     '',
+      };
     } else if (proposedAction === 'Time Out') {
       const updatedLog = { ...existingLog, timeOut: now, branchOut: branch.code, synced: false };
       await saveLog(updatedLog);
-      try {
-        await pushLogToSheets({
-          uid: emp.uid || `#${emp.id}`,
-          employeeName: emp.name,
-          date:     today,
-          timeIn:   new Date(updatedLog.timeIn).toLocaleTimeString(),
-          timeOut:  new Date(now).toLocaleTimeString(),
-          branchIn:  updatedLog.branchIn ?? updatedLog.branchCode,
-          branchOut: branch.code,
-          duration:  calcDuration(updatedLog.timeIn, now),
-        });
-      } catch {/* offline */}
+      sheetsPayload = {
+        uid:          emp.uid || `#${emp.id}`,
+        employeeName: emp.name,
+        date:         today,
+        timeIn:       new Date(updatedLog.timeIn).toLocaleTimeString(),
+        timeOut:      new Date(now).toLocaleTimeString(),
+        branchIn:     updatedLog.branchIn ?? updatedLog.branchCode,
+        branchOut:    branch.code,
+        duration:     calcDuration(updatedLog.timeIn, now),
+      };
+      sheetsFn = updateLogInSheets;  // update the existing row, not append
     }
 
+    // Show result card immediately — don't wait for Sheets
     setLastResult({
-      name:   emp.name,
-      uid:    emp.uid || `#${emp.id}`,
-      action: proposedAction,
-      time:   new Date().toLocaleTimeString(),
+      name:       emp.name,
+      uid:        emp.uid || `#${emp.id}`,
+      action:     proposedAction,
+      time:       new Date().toLocaleTimeString(),
+      syncStatus: sheetsPayload ? 'syncing' : 'idle',
     });
     setPending(null);
+
+    // Push/update Sheets in the background and update sync status
+    if (sheetsPayload) {
+      try {
+        await sheetsFn(sheetsPayload);
+        setLastResult((r) => ({ ...r, syncStatus: 'synced' }));
+      } catch {
+        setLastResult((r) => ({ ...r, syncStatus: 'failed' }));
+      }
+    }
   }
 
   function handleCancelConfirm() {
@@ -499,6 +511,20 @@ export default function TimeInOutPage() {
                 {lastResult.action}
               </p>
               <p className="text-sm text-gray-500 mt-1">{lastResult.time}</p>
+
+              {/* Sheets sync status */}
+              <div className="mt-2 text-xs">
+                {lastResult.syncStatus === 'syncing' && (
+                  <span className="text-gray-400">Syncing to Google Sheets…</span>
+                )}
+                {lastResult.syncStatus === 'synced' && (
+                  <span className="text-green-600 font-medium">✓ Synced to Google Sheets</span>
+                )}
+                {lastResult.syncStatus === 'failed' && (
+                  <span className="text-amber-600 font-medium">⚠ Saved locally — will sync when online</span>
+                )}
+              </div>
+
               <button
                 onClick={startScan}
                 className="mt-4 bg-brand hover:bg-brand-dark text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"

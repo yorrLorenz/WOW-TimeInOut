@@ -166,6 +166,53 @@ export async function deleteEmployee(id) {
   return db.delete('employees', id);
 }
 
+/**
+ * Import an employee from a remote source (e.g. EmployeeSync sheet),
+ * preserving the existing UID instead of auto-generating one.
+ */
+export async function importEmployee({ uid, name, position, homeBranch, descriptors, createdAt }) {
+  const db = await getDB();
+  return db.add('employees', {
+    uid:        uid        || '',
+    name:       name       || '',
+    position:   position   || '',
+    homeBranch: homeBranch || '',
+    descriptors: descriptors || [],
+    createdAt:  createdAt  || new Date().toISOString(),
+  });
+}
+
+/**
+ * Merge remote employees (from EmployeeSync sheet) into local IndexedDB.
+ * Rules:
+ *   - Remote employee not in local  → import them (with or without face data)
+ *   - Both exist, local has no face data, remote does → update local with remote descriptors
+ *   - Both exist, local already has face data → keep local (authoritative for face)
+ * Returns { added, updated } counts.
+ */
+export async function mergeEmployeesFromRemote(remoteEmps) {
+  const local = await getAllEmployees();
+  const localByUID = {};
+  for (const emp of local) {
+    if (emp.uid) localByUID[emp.uid] = emp;
+  }
+
+  let added = 0, updated = 0;
+  for (const remote of remoteEmps) {
+    if (!remote.uid) continue;
+    const localEmp = localByUID[remote.uid];
+
+    if (!localEmp) {
+      await importEmployee(remote);
+      added++;
+    } else if (!(localEmp.descriptors?.length) && remote.descriptors?.length) {
+      await saveEmployee({ ...localEmp, descriptors: remote.descriptors });
+      updated++;
+    }
+  }
+  return { added, updated };
+}
+
 // ── Attendance Logs ──────────────────────────────────────────────────────────
 
 export function todayDateString() {

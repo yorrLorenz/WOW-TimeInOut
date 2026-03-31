@@ -25,12 +25,12 @@ function ElapsedTime({ timeIn }) {
   }, [timeIn]);
   return <span className="text-xs font-semibold text-brand">▶ {elapsed}</span>;
 }
-
-// ── Shared helpers ────────────────────────────────────────────────────────────
+ 
+// ── Shared helpers ───────────────────────────────────────────────────────────
 
 function formatTime(iso) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); 
 }
 
 function duration(timeIn, timeOut) {

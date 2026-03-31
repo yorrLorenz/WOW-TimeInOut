@@ -16,7 +16,16 @@ import {
   saveBranch,
   deleteBranch,
 } from '../lib/db';
-import { getAppsScriptUrl, saveAppsScriptUrl, bulkPushLogsToSheets, calcDuration } from '../lib/sheets';
+import {
+  getAppsScriptUrl, saveAppsScriptUrl,
+  pushLogToSheets, updateLogInSheets, bulkPushLogsToSheets,
+  bulkSyncEmployeesToSheets, generateMonthlySummaryToSheets,
+  upsertEmployeeToSheets, fetchEmployeesFromSheets,
+  computePeriodSummary, generatePeriodOptions,
+  getStandardHours, saveStandardHours,
+  calcDuration,
+} from '../lib/sheets';
+import { mergeEmployeesFromRemote } from '../lib/db';
 import { useCamera } from '../hooks/useCamera';
 import CameraView from '../components/CameraView';
 import { loadModels, detectSingleFaceDescriptor, descriptorToArray } from '../lib/faceApi';
@@ -659,18 +668,21 @@ function ManualEntryTab({ branch }) {
   }, [branch, isSuperAdmin]);
 
   async function loadOpenLogs() {
-    const today = todayDateString();
-    const branchFilter = isSuperAdmin ? undefined : branch.code;
-    const raw = await getLogsByDate(today, branchFilter);
-    const open = raw.filter((l) => !l.timeOut);
+    const all  = await getAllLogs();
+    const open = all.filter((l) => {
+      if (l.timeOut) return false;
+      if (!isSuperAdmin) return l.branchCode === branch.code || l.branchIn === branch.code;
+      return true;
+    });
     const enriched = await Promise.all(
       open.map(async (l) => {
         const emp = await getEmployee(l.employeeId);
         return { ...l, employeeName: emp?.name ?? `#${l.employeeId}`, uid: emp?.uid ?? '' };
       })
     );
+    // Most recent first
+    enriched.sort((a, b) => new Date(b.timeIn) - new Date(a.timeIn));
     setOpenLogs(enriched);
-    // Default timeout time to now
     const now = new Date();
     setTimeoutTime(`${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`);
   }
@@ -681,24 +693,40 @@ function ManualEntryTab({ branch }) {
     if (!employeeId) { setStatus('Select an employee.'); return; }
     if (isSuperAdmin && !logBranch) { setStatus('Select a target branch.'); return; }
     try {
-      const timeInISO = new Date(`${date}T${timeIn}:00`).toISOString();
+      const emp        = employees.find((em) => String(em.id) === String(employeeId));
+      const timeInISO  = new Date(`${date}T${timeIn}:00`).toISOString();
       const timeOutISO = includeOut ? new Date(`${date}T${timeOut}:00`).toISOString() : null;
       await addLog({
         employeeId: Number(employeeId),
         branchCode: logBranch,
-        branchIn: logBranch,
-        branchOut: includeOut ? logBranch : null,
+        branchIn:   logBranch,
+        branchOut:  includeOut ? logBranch : null,
         date,
-        timeIn: timeInISO,
+        timeIn:  timeInISO,
         timeOut: timeOutISO,
-        synced: false,
-        manual: true,
-        note: note.trim(),
+        synced:  false,
+        manual:  true,
+        note:    note.trim(),
       });
-      setStatus('Log entry added successfully.');
+      setStatus('Log entry added — syncing to Sheets…');
       setEmployeeId('');
       setNote('Manual entry');
       await loadOpenLogs();
+      try {
+        await pushLogToSheets({
+          uid:          emp?.uid || `#${employeeId}`,
+          employeeName: emp?.name || '',
+          date,
+          timeIn:   new Date(timeInISO).toLocaleTimeString(),
+          timeOut:  timeOutISO ? new Date(timeOutISO).toLocaleTimeString() : '',
+          branchIn:  logBranch,
+          branchOut: includeOut ? logBranch : '',
+          duration:  timeOutISO ? calcDuration(timeInISO, timeOutISO) : '',
+        });
+        setStatus('Log entry added and synced to Google Sheets.');
+      } catch {
+        setStatus('Log entry added. Sheets sync failed — saved locally.');
+      }
     } catch (err) {
       setStatus('Error: ' + err.message);
     }
@@ -711,21 +739,31 @@ function ManualEntryTab({ branch }) {
     const log = openLogs.find((l) => String(l.id) === timeoutLogId);
     if (!log) { setTimeoutStatus('Log not found.'); return; }
     try {
-      const timeOutISO = new Date(`${log.date}T${timeoutTime}:00`).toISOString();
+      const timeOutISO  = new Date(`${log.date}T${timeoutTime}:00`).toISOString();
+      const branchOut   = log.branchIn ?? log.branchCode;
       if (new Date(timeOutISO) <= new Date(log.timeIn)) {
         setTimeoutStatus('Time-out must be after time-in.');
         return;
       }
-      await saveLog({
-        ...log,
-        timeOut: timeOutISO,
-        branchOut: log.branchIn ?? log.branchCode,
-        synced: false,
-        note: timeoutNote.trim(),
-      });
-      setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime}.`);
+      await saveLog({ ...log, timeOut: timeOutISO, branchOut, synced: false, note: timeoutNote.trim() });
+      setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime} — syncing…`);
       setTimeoutLogId('');
       await loadOpenLogs();
+      try {
+        await updateLogInSheets({
+          uid:          log.uid,
+          employeeName: log.employeeName,
+          date:         log.date,
+          timeIn:       new Date(log.timeIn).toLocaleTimeString(),
+          timeOut:      new Date(timeOutISO).toLocaleTimeString(),
+          branchIn:     log.branchIn ?? log.branchCode,
+          branchOut,
+          duration:     calcDuration(log.timeIn, timeOutISO),
+        });
+        setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime} — synced to Google Sheets.`);
+      } catch {
+        setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime}. Sheets sync failed — saved locally.`);
+      }
     } catch (err) {
       setTimeoutStatus('Error: ' + err.message);
     }
@@ -821,17 +859,17 @@ function ManualEntryTab({ branch }) {
       <div className="max-w-md border-t border-gray-100 pt-6">
         <h2 className="font-semibold text-gray-700 mb-1">Manual Time-Out</h2>
         <p className="text-xs text-gray-400 mb-4">
-          Time out an employee who forgot to clock out today.
+          Time out an employee who has no recorded clock-out.
         </p>
 
         {openLogs.length === 0 ? (
           <p className="text-sm text-gray-400 bg-gray-50 border border-gray-100 rounded-lg px-3 py-3">
-            No employees currently clocked in today.
+            No employees with an open Time In entry.
           </p>
         ) : (
           <form onSubmit={handleManualTimeout} className="space-y-3">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Currently Clocked In</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Clocked In (no Time Out)</label>
               <select
                 value={timeoutLogId}
                 onChange={(e) => setTimeoutLogId(e.target.value)}
@@ -840,7 +878,7 @@ function ManualEntryTab({ branch }) {
                 <option value="">— Select Employee —</option>
                 {openLogs.map((l) => (
                   <option key={l.id} value={l.id}>
-                    {l.employeeName}{l.uid ? ` (${l.uid})` : ''} — in at {formatTime(l.timeIn)}
+                    {l.employeeName}{l.uid ? ` (${l.uid})` : ''} — {l.date} {formatTime(l.timeIn)}
                   </option>
                 ))}
               </select>
@@ -885,56 +923,149 @@ function ManualEntryTab({ branch }) {
 
 function SettingsTab({ branch }) {
   const isSuperAdmin = branch.isAdmin;
-  const [url, setUrl] = useState(getAppsScriptUrl());
-  const [syncing, setSyncing] = useState(false);
-  const [status, setStatus] = useState('');
+
+  const periodOptions = generatePeriodOptions();
+
+  const [url,            setUrl]            = useState(getAppsScriptUrl());
+  const [stdHours,       setStdHours]       = useState(getStandardHours());
+  const [syncing,        setSyncing]        = useState(false);
+  const [logStatus,      setLogStatus]      = useState('');
+  const [empSyncing,     setEmpSyncing]     = useState(false);
+  const [empStatus,      setEmpStatus]      = useState('');
+  const [pullSyncing,    setPullSyncing]    = useState(false);
+  const [pullStatus,     setPullStatus]     = useState('');
+  const [pushSyncing,    setPushSyncing]    = useState(false);
+  const [pushStatus,     setPushStatus]     = useState('');
+  const [selectedPeriod, setSelectedPeriod] = useState(0);   // index into periodOptions
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [summaryStatus,  setSummaryStatus]  = useState('');
 
   function handleSaveUrl() {
     saveAppsScriptUrl(url.trim());
-    setStatus('Apps Script URL saved.');
+    setLogStatus('Apps Script URL saved.');
+  }
+
+  function handleSaveStdHours() {
+    const h = Number(stdHours);
+    if (h > 0 && h <= 24) { saveStandardHours(h); setSummaryStatus('Standard hours saved.'); }
   }
 
   async function handleBulkSync() {
     setSyncing(true);
-    setStatus('');
+    setLogStatus('');
     try {
       const logs = await getAllLogs();
       const unsynced = isSuperAdmin
         ? logs.filter((l) => !l.synced)
         : logs.filter((l) => !l.synced && l.branchCode === branch.code);
 
-      if (unsynced.length === 0) { setStatus('Nothing to sync.'); return; }
+      if (unsynced.length === 0) { setLogStatus('Nothing to sync.'); return; }
 
       const enriched = await Promise.all(
         unsynced.map(async (l) => {
           const emp = await getEmployee(l.employeeId);
           return {
-            uid: emp?.uid ?? '',
+            uid:          emp?.uid ?? '',
             employeeName: emp?.name ?? `#${l.employeeId}`,
-            date: l.date,
-            timeIn: l.timeIn ? new Date(l.timeIn).toLocaleTimeString() : '',
-            timeOut: l.timeOut ? new Date(l.timeOut).toLocaleTimeString() : '',
-            branchIn: l.branchIn ?? l.branchCode ?? '',
-            branchOut: l.branchOut ?? '',
-            duration: calcDuration(l.timeIn, l.timeOut),
+            date:         l.date,
+            timeIn:       l.timeIn  ? new Date(l.timeIn).toLocaleTimeString()  : '',
+            timeOut:      l.timeOut ? new Date(l.timeOut).toLocaleTimeString() : '',
+            branchIn:     l.branchIn  ?? l.branchCode ?? '',
+            branchOut:    l.branchOut ?? '',
+            duration:     calcDuration(l.timeIn, l.timeOut),
           };
         })
       );
       await bulkPushLogsToSheets(enriched);
-      setStatus(`Synced ${unsynced.length} record(s) to Google Sheets.`);
+      setLogStatus(`Synced ${unsynced.length} record(s) to Google Sheets.`);
     } catch (err) {
-      setStatus('Sync failed: ' + err.message);
+      setLogStatus('Sync failed: ' + err.message);
     } finally {
       setSyncing(false);
     }
   }
 
+  async function handleSyncEmployees() {
+    setEmpSyncing(true);
+    setEmpStatus('');
+    try {
+      const emps = await getAllEmployees();
+      await bulkSyncEmployeesToSheets(emps);
+      setEmpStatus(`Synced ${emps.length} employee(s) to the Employees sheet.`);
+    } catch (err) {
+      setEmpStatus('Sync failed: ' + err.message);
+    } finally {
+      setEmpSyncing(false);
+    }
+  }
+
+  async function handlePullFromSheets() {
+    setPullSyncing(true);
+    setPullStatus('');
+    try {
+      const remote = await fetchEmployeesFromSheets();
+      if (remote.length === 0) {
+        setPullStatus('No employees found in EmployeeSync sheet. Add rows manually or use "Push All" first.');
+        return;
+      }
+      const { added, updated } = await mergeEmployeesFromRemote(remote);
+      setPullStatus(`Done — ${added} added, ${updated} updated with face data. ${remote.length - added - updated} already up to date.`);
+    } catch (err) {
+      setPullStatus('Pull failed: ' + err.message);
+    } finally {
+      setPullSyncing(false);
+    }
+  }
+
+  async function handlePushAllToSync() {
+    setPushSyncing(true);
+    setPushStatus('');
+    try {
+      const emps = await getAllEmployees();
+      let count = 0;
+      for (const emp of emps) {
+        await upsertEmployeeToSheets(emp);
+        count++;
+      }
+      setPushStatus(`Pushed ${count} employee(s) with face data to EmployeeSync sheet.`);
+    } catch (err) {
+      setPushStatus('Push failed: ' + err.message);
+    } finally {
+      setPushSyncing(false);
+    }
+  }
+
+  async function handleGenerateSummary() {
+    setSummaryLoading(true);
+    setSummaryStatus('');
+    try {
+      const period = periodOptions[selectedPeriod];
+      const [logs, emps] = await Promise.all([getAllLogs(), getAllEmployees()]);
+      const rows = computePeriodSummary(logs, emps, period.year, period.month, period.half, getStandardHours());
+      if (rows.length === 0) {
+        setSummaryStatus('No completed attendance records found for this period.');
+        return;
+      }
+      await generateMonthlySummaryToSheets(period.label, rows);
+      setSummaryStatus(`Generated summary for ${period.label} — ${rows.length} employee(s) written to Monthly Summary sheet.`);
+    } catch (err) {
+      setSummaryStatus('Failed: ' + err.message);
+    } finally {
+      setSummaryLoading(false);
+    }
+  }
+
+  const btnClass  = 'text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors';
+  const statusBox = 'text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2';
+
   return (
-    <div className="max-w-lg space-y-6">
+    <div className="max-w-lg space-y-8">
+
+      {/* ── Apps Script URL ── */}
       <div>
-        <h2 className="font-semibold text-gray-700 mb-3">Google Sheets Integration</h2>
+        <h2 className="font-semibold text-gray-700 mb-1">Google Sheets — Apps Script URL</h2>
         <p className="text-xs text-gray-500 mb-3">
-          Deploy the Apps Script Web App (see <code className="bg-gray-100 px-1 rounded">apps-script/Code.gs</code>) and paste the URL below.
+          Deploy <code className="bg-gray-100 px-1 rounded">apps-script/Code.gs</code> as a Web App and paste the URL here.
         </p>
         <div className="flex gap-2">
           <input
@@ -944,29 +1075,124 @@ function SettingsTab({ branch }) {
             placeholder="https://script.google.com/macros/s/…/exec"
             className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
           />
-          <button onClick={handleSaveUrl}
-            className="bg-brand hover:bg-brand-dark text-white text-sm font-semibold px-3 py-2 rounded-lg">
-            Save
-          </button>
+          <button onClick={handleSaveUrl} className={`bg-brand hover:bg-brand-dark ${btnClass}`}>Save</button>
         </div>
+        {logStatus && <p className={`mt-2 ${statusBox}`}>{logStatus}</p>}
       </div>
 
+      {/* ── Bulk sync attendance logs ── */}
       <div>
-        <h2 className="font-semibold text-gray-700 mb-2">
-          Sync Unsynced Logs {isSuperAdmin ? '(All Branches)' : ''}
+        <h2 className="font-semibold text-gray-700 mb-1">
+          Sync Offline Attendance Logs {isSuperAdmin ? '(All Branches)' : ''}
         </h2>
-        <button
-          onClick={handleBulkSync}
-          disabled={syncing}
-          className="bg-green-600 hover:bg-green-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors"
-        >
-          {syncing ? 'Syncing…' : 'Sync Now'}
+        <p className="text-xs text-gray-500 mb-3">Pushes any logs that failed to sync in real-time.</p>
+        <button onClick={handleBulkSync} disabled={syncing} className={`bg-green-600 hover:bg-green-700 ${btnClass}`}>
+          {syncing ? 'Syncing…' : 'Sync Offline Logs'}
         </button>
       </div>
 
-      {status && (
-        <p className="text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">{status}</p>
-      )}
+      {/* ── Employee directory sync ── */}
+      <div className="border-t border-gray-100 pt-6">
+        <h2 className="font-semibold text-gray-700 mb-1">Sync Employee Directory</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Writes all employees to the <strong>Employees</strong> sheet (UID, Name, Position, Branch, Face Status, Created At).
+          Face recognition data cannot be stored in a spreadsheet — only registration status is shown.
+        </p>
+        <button onClick={handleSyncEmployees} disabled={empSyncing} className={`bg-brand hover:bg-brand-dark ${btnClass}`}>
+          {empSyncing ? 'Syncing…' : 'Sync Employees to Sheets'}
+        </button>
+        {empStatus && <p className={`mt-2 ${statusBox}`}>{empStatus}</p>}
+      </div>
+
+      {/* ── Cross-branch face data sync ── */}
+      <div className="border-t border-gray-100 pt-6">
+        <h2 className="font-semibold text-gray-700 mb-1">Cross-Branch Employee Sync</h2>
+        <p className="text-xs text-gray-500 mb-4">
+          The <strong>EmployeeSync</strong> sheet is the shared database for all branches.
+          Face data is automatically pushed here when an employee registers.
+          Use these buttons for initial setup or when setting up a new branch kiosk.
+        </p>
+
+        <div className="space-y-4">
+          {/* Pull */}
+          <div>
+            <p className="text-sm font-medium text-gray-700 mb-1">Pull from Sheets → this device</p>
+            <p className="text-xs text-gray-400 mb-2">
+              Imports employees from EmployeeSync into this kiosk. Run this on a new branch PC or after adding employees manually to the sheet.
+            </p>
+            <button onClick={handlePullFromSheets} disabled={pullSyncing} className={`bg-blue-600 hover:bg-blue-700 ${btnClass}`}>
+              {pullSyncing ? 'Pulling…' : 'Pull Employees from Sheets'}
+            </button>
+            {pullStatus && <p className={`mt-2 ${statusBox}`}>{pullStatus}</p>}
+          </div>
+
+          {/* Push all */}
+          <div>
+            <p className="text-sm font-medium text-gray-700 mb-1">Push all → EmployeeSync sheet</p>
+            <p className="text-xs text-gray-400 mb-2">
+              Uploads all employees on this device (including face data) to the EmployeeSync sheet.
+              Use once for initial setup so other branches can pull them.
+            </p>
+            <button onClick={handlePushAllToSync} disabled={pushSyncing} className={`bg-gray-700 hover:bg-gray-800 ${btnClass}`}>
+              {pushSyncing ? 'Pushing…' : 'Push All Employees to Sync Sheet'}
+            </button>
+            {pushStatus && <p className={`mt-2 ${statusBox}`}>{pushStatus}</p>}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Monthly summary ── */}
+      <div className="border-t border-gray-100 pt-6">
+        <h2 className="font-semibold text-gray-700 mb-1">Generate Monthly Summary</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Computes per-employee totals for a 15-day period and writes them to the <strong>Monthly Summary</strong> sheet.
+          Existing rows for the chosen period are replaced.
+        </p>
+
+        <div className="space-y-3">
+          <div className="flex gap-3 items-end">
+            <div className="flex-1">
+              <label className="block text-xs font-medium text-gray-600 mb-1">Period</label>
+              <select
+                value={selectedPeriod}
+                onChange={(e) => setSelectedPeriod(Number(e.target.value))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
+              >
+                {periodOptions.map((p, i) => (
+                  <option key={p.label} value={i}>{p.label}{i === 0 ? ' (current)' : ''}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Std hours/day</label>
+              <div className="flex gap-1">
+                <input
+                  type="number"
+                  min="1" max="24"
+                  value={stdHours}
+                  onChange={(e) => setStdHours(e.target.value)}
+                  className="w-16 border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
+                />
+                <button onClick={handleSaveStdHours} className="text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium px-2 py-2 rounded-lg">Set</button>
+              </div>
+            </div>
+          </div>
+
+          <button onClick={handleGenerateSummary} disabled={summaryLoading} className={`bg-gray-700 hover:bg-gray-800 ${btnClass}`}>
+            {summaryLoading ? 'Generating…' : 'Generate & Push to Sheets'}
+          </button>
+        </div>
+
+        {summaryStatus && <p className={`mt-2 ${statusBox}`}>{summaryStatus}</p>}
+
+        <div className="mt-4 bg-gray-50 border border-gray-100 rounded-lg p-3 text-xs text-gray-500 space-y-1">
+          <p><strong>Working Days</strong> — days with a complete Time In + Time Out</p>
+          <p><strong>Overtime Days</strong> — days where total hours &gt; standard hours/day</p>
+          <p><strong>Undertime Days</strong> — days where total hours &lt; standard hours/day (but &gt; 0)</p>
+          <p><strong>Total Hours</strong> — sum of all duration hours for the period</p>
+        </div>
+      </div>
+
     </div>
   );
 }
