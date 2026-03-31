@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useBranch } from '../context/BranchContext';
-import { getBranch, saveBranch } from '../lib/db';
+import { getBranch, saveBranch, mergeBranchesFromRemote } from '../lib/db';
+import { fetchBranchesFromSheets } from '../lib/sheets';
 
 const DEFAULT_BRANCHES = [
   { code: 'MAIN-001', name: 'Main Branch' },
@@ -18,6 +19,17 @@ export default function LoginPage() {
   const [showPin, setShowPin] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  // Silently pull latest branches from Sheets on every login page load
+  // so new/updated branch accounts are available without any admin action.
+  useEffect(() => {
+    (async () => {
+      try {
+        const remote = await fetchBranchesFromSheets();
+        if (remote.length > 0) await mergeBranchesFromRemote(remote);
+      } catch { /* offline or URL not configured — safe to ignore */ }
+    })();
+  }, []);
 
   async function handleLogin(e) {
     e.preventDefault();

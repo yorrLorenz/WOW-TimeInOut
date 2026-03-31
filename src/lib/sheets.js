@@ -97,6 +97,51 @@ export async function fetchEmployeesFromSheets() {
   return data.employees || [];
 }
 
+// ── Branch sync ───────────────────────────────────────────────────────────────
+
+/**
+ * Pull all custom branches from the Branches sheet.
+ * Called on login page load so every device gets the latest branch list.
+ */
+export async function fetchBranchesFromSheets() {
+  const url = getAppsScriptUrl();
+  if (!url) throw new Error('Apps Script URL not configured.');
+  const res = await fetch(`${url}?action=getBranches`);
+  if (!res.ok) throw new Error(`Branch fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.branches || [];
+}
+
+/**
+ * Push one branch (create or update) to the Branches sheet.
+ * Called automatically whenever a branch is saved in AdminPage.
+ */
+export async function upsertBranchToSheets(branch) {
+  const url = getAppsScriptUrl();
+  if (!url) throw new Error('Apps Script URL not configured.');
+  const res = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify({ action: 'upsertBranch', code: branch.code, name: branch.name, pin: branch.pin || '' }),
+  });
+  if (!res.ok) throw new Error(`Branch upsert failed: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Remove a branch from the Branches sheet.
+ * Called automatically when a branch is deleted in AdminPage.
+ */
+export async function deleteBranchFromSheets(code) {
+  const url = getAppsScriptUrl();
+  if (!url) throw new Error('Apps Script URL not configured.');
+  const res = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify({ action: 'deleteBranch', code }),
+  });
+  if (!res.ok) throw new Error(`Branch delete failed: ${res.status}`);
+  return res.json();
+}
+
 // ── Employee directory ────────────────────────────────────────────────────────
 
 /**

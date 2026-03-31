@@ -125,6 +125,28 @@ export async function deleteBranch(code) {
   return db.delete('branches', code);
 }
 
+/**
+ * Merge branches pulled from Sheets into local IndexedDB.
+ * - New branch → add it
+ * - Existing branch with changed name/PIN → update it
+ * - SUPER-ADMIN is never overwritten from remote (security)
+ */
+export async function mergeBranchesFromRemote(remoteBranches) {
+  let added = 0, updated = 0;
+  for (const remote of remoteBranches) {
+    if (!remote.code || remote.code === 'SUPER-ADMIN') continue;
+    const local = await getBranch(remote.code);
+    if (!local) {
+      await saveBranch({ code: remote.code, name: remote.name, pin: remote.pin });
+      added++;
+    } else if (local.name !== remote.name || local.pin !== remote.pin) {
+      await saveBranch({ ...local, name: remote.name, pin: remote.pin });
+      updated++;
+    }
+  }
+  return { added, updated };
+}
+
 // ── Employees ───────────────────────────────────────────────────────────────
 
 export async function getEmployee(id) {
@@ -216,7 +238,8 @@ export async function mergeEmployeesFromRemote(remoteEmps) {
 // ── Attendance Logs ──────────────────────────────────────────────────────────
 
 export function todayDateString() {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 export async function getLogsByDate(date, branchCode) {

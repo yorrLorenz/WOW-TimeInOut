@@ -11,12 +11,19 @@ import {
 } from '../lib/faceApi';
 import {
   getAllEmployees,
+  getAllLogs,
   getTodayLogForEmployee,
   addLog,
   saveLog,
   todayDateString,
 } from '../lib/db';
-import { pushLogToSheets, updateLogInSheets, calcDuration } from '../lib/sheets';
+import {
+  pushLogToSheets, updateLogInSheets, calcDuration,
+  computePeriodSummary, generateMonthlySummaryToSheets,
+  generatePeriodOptions, getStandardHours,
+  fetchEmployeesFromSheets,
+} from '../lib/sheets';
+import { mergeEmployeesFromRemote } from '../lib/db';
 
 const SCAN_INTERVAL_MS     = 100;
 
@@ -112,6 +119,17 @@ export default function TimeInOutPage() {
       await loadModels();
       setModelsReady(true);
       await refreshEmployees();
+      // Background: silently pull latest face data from EmployeeSync sheet
+      // so kiosks stay up-to-date without any admin action required.
+      (async () => {
+        try {
+          const remote = await fetchEmployeesFromSheets();
+          if (remote.length > 0) {
+            const { added, updated } = await mergeEmployeesFromRemote(remote);
+            if (added + updated > 0) await refreshEmployees();
+          }
+        } catch { /* no Apps Script URL configured or offline — safe to ignore */ }
+      })();
     }
     init();
   }, []);
@@ -276,9 +294,10 @@ export default function TimeInOutPage() {
 
     let sheetsPayload = null;
     let sheetsFn      = pushLogToSheets;   // 'add' for Time In, 'update' for Time Out
+    let savedLog      = null;              // full log object written to DB (for marking synced)
 
     if (proposedAction === 'Time In') {
-      await addLog({
+      const logData = {
         employeeId: emp.id,
         branchCode: branch.code,
         branchIn:   branch.code,
@@ -287,7 +306,9 @@ export default function TimeInOutPage() {
         timeIn:     now,
         timeOut:    null,
         synced:     false,
-      });
+      };
+      const logId = await addLog(logData);
+      savedLog = { ...logData, id: logId };
       sheetsPayload = {
         uid:          emp.uid || `#${emp.id}`,
         employeeName: emp.name,
@@ -299,17 +320,17 @@ export default function TimeInOutPage() {
         duration:     '',
       };
     } else if (proposedAction === 'Time Out') {
-      const updatedLog = { ...existingLog, timeOut: now, branchOut: branch.code, synced: false };
-      await saveLog(updatedLog);
+      savedLog = { ...existingLog, timeOut: now, branchOut: branch.code, synced: false };
+      await saveLog(savedLog);
       sheetsPayload = {
         uid:          emp.uid || `#${emp.id}`,
         employeeName: emp.name,
         date:         today,
-        timeIn:       new Date(updatedLog.timeIn).toLocaleTimeString(),
+        timeIn:       new Date(savedLog.timeIn).toLocaleTimeString(),
         timeOut:      new Date(now).toLocaleTimeString(),
-        branchIn:     updatedLog.branchIn ?? updatedLog.branchCode,
+        branchIn:     savedLog.branchIn ?? savedLog.branchCode,
         branchOut:    branch.code,
-        duration:     calcDuration(updatedLog.timeIn, now),
+        duration:     calcDuration(savedLog.timeIn, now),
       };
       sheetsFn = updateLogInSheets;  // update the existing row, not append
     }
@@ -325,10 +346,26 @@ export default function TimeInOutPage() {
     setPending(null);
 
     // Push/update Sheets in the background and update sync status
-    if (sheetsPayload) {
+    if (sheetsPayload && savedLog) {
       try {
         await sheetsFn(sheetsPayload);
+        // Mark log as synced so "Sync Offline Logs" won't re-send it
+        await saveLog({ ...savedLog, synced: true });
         setLastResult((r) => ({ ...r, syncStatus: 'synced' }));
+
+        // Q3: After a completed Time Out, silently refresh the current period summary
+        if (proposedAction === 'Time Out') {
+          (async () => {
+            try {
+              const [allLogs, allEmps] = await Promise.all([getAllLogs(), getAllEmployees()]);
+              const [period] = generatePeriodOptions();
+              const rows = computePeriodSummary(
+                allLogs, allEmps, period.year, period.month, period.half, getStandardHours()
+              );
+              if (rows.length > 0) await generateMonthlySummaryToSheets(period.label, rows);
+            } catch { /* non-critical — summary will be regenerated manually if needed */ }
+          })();
+        }
       } catch {
         setLastResult((r) => ({ ...r, syncStatus: 'failed' }));
       }

@@ -19,6 +19,7 @@ var SHEET_NAME    = 'Attendance';
 var EMP_SHEET     = 'Employees';
 var MONTHLY_SHEET = 'Monthly Summary';
 var SYNC_SHEET    = 'EmployeeSync';   // stores descriptors — used for cross-branch face data sharing
+var BRANCH_SHEET  = 'Branches';       // custom branch accounts (code, name, pin)
 
 /** Normalise any date value from a sheet cell to 'yyyy-MM-dd'. */
 function toDateString(val) {
@@ -60,6 +61,20 @@ function getOrCreateMonthlySheet() {
     sheet.appendRow(['Period', 'UID', 'Name', 'Home Branch', 'Working Days', 'Total Hours', 'Overtime Days', 'Undertime Days', 'Generated At']);
     sheet.getRange(1, 1, 1, 9).setFontWeight('bold');
     sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function getOrCreateBranchSheet() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(BRANCH_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(BRANCH_SHEET);
+    sheet.appendRow(['Code', 'Name', 'PIN', 'Updated At']);
+    sheet.getRange(1, 1, 1, 4).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    // Protect PIN column from casual viewing — admin should restrict sheet access
+    sheet.hideColumns(3);
   }
   return sheet;
 }
@@ -227,6 +242,44 @@ function doPost(e) {
         mSheet.getRange(mSheet.getLastRow() + 1, 1, newRows.length, 9).setValues(newRows);
       }
 
+    // ── Branches: upsert (create or update) ──────────────────────────────────
+    } else if (data.action === 'upsertBranch') {
+      var bSheet = getOrCreateBranchSheet();
+      var bLast  = bSheet.getLastRow();
+      var bFound = false;
+      if (bLast > 1) {
+        var bCodes = bSheet.getRange(2, 1, bLast - 1, 1).getValues();
+        for (var bi = 0; bi < bCodes.length; bi++) {
+          if (String(bCodes[bi][0]) === String(data.code)) {
+            bSheet.getRange(bi + 2, 1, 1, 4).setValues([[
+              data.code || '',
+              data.name || '',
+              data.pin  || '',
+              new Date().toISOString(),
+            ]]);
+            bFound = true;
+            break;
+          }
+        }
+      }
+      if (!bFound) {
+        bSheet.appendRow([data.code || '', data.name || '', data.pin || '', new Date().toISOString()]);
+      }
+
+    // ── Branches: delete ──────────────────────────────────────────────────────
+    } else if (data.action === 'deleteBranch') {
+      var bSheet2 = getOrCreateBranchSheet();
+      var bLast2  = bSheet2.getLastRow();
+      if (bLast2 > 1) {
+        var bCodes2 = bSheet2.getRange(2, 1, bLast2 - 1, 1).getValues();
+        for (var bj = bCodes2.length - 1; bj >= 0; bj--) {
+          if (String(bCodes2[bj][0]) === String(data.code)) {
+            bSheet2.deleteRow(bj + 2);
+            break;
+          }
+        }
+      }
+
     } else {
       return jsonResponse({ success: false, error: 'Unknown action' });
     }
@@ -239,6 +292,24 @@ function doPost(e) {
 
 function doGet(e) {
   var params = (e && e.parameter) ? e.parameter : {};
+
+  if (params.action === 'getBranches') {
+    try {
+      var bSheet = getOrCreateBranchSheet();
+      var last   = bSheet.getLastRow();
+      if (last < 2) return jsonResponse({ branches: [] });
+      var rows = bSheet.getRange(2, 1, last - 1, 4).getValues();
+      var branches = rows
+        .filter(function(r) { return r[0]; })
+        .map(function(r) {
+          return { code: String(r[0]), name: String(r[1]), pin: String(r[2]) };
+        });
+      return jsonResponse({ branches: branches });
+    } catch(err) {
+      return jsonResponse({ branches: [], error: err.message });
+    }
+  }
+
   if (params.action === 'getEmployees') {
     try {
       var syncSheet = getOrCreateSyncSheet();

@@ -21,6 +21,7 @@ import {
   pushLogToSheets, updateLogInSheets, bulkPushLogsToSheets,
   bulkSyncEmployeesToSheets, generateMonthlySummaryToSheets,
   upsertEmployeeToSheets, fetchEmployeesFromSheets,
+  upsertBranchToSheets, deleteBranchFromSheets,
   computePeriodSummary, generatePeriodOptions,
   getStandardHours, saveStandardHours,
   calcDuration,
@@ -112,7 +113,10 @@ function FaceUpdateModal({ employee, onClose, onSaved }) {
     if (captures.length < 3) { setStatus('Capture at least 3 samples first.'); return; }
     setSaving(true);
     try {
-      await saveEmployee({ ...employee, descriptors: captures });
+      const updated = { ...employee, descriptors: captures };
+      await saveEmployee(updated);
+      // Auto-push updated face data to EmployeeSync so other branches get it
+      try { await upsertEmployeeToSheets(updated); } catch { /* offline — ok */ }
       onSaved();
       onClose();
     } catch (err) {
@@ -231,7 +235,9 @@ function BranchesTab() {
     if (!code || !form.name.trim()) { setStatus('Code and name are required.'); return; }
     if (code === 'SUPER-ADMIN') { setStatus('That code is reserved.'); return; }
     try {
-      await saveBranch({ code, name: form.name.trim(), pin: form.pin.trim() });
+      const branch = { code, name: form.name.trim(), pin: form.pin.trim() };
+      await saveBranch(branch);
+      try { await upsertBranchToSheets(branch); } catch { /* offline — ok */ }
       setStatus(editingCode ? 'Branch updated.' : 'Branch created.');
       setShowForm(false);
       load();
@@ -243,6 +249,7 @@ function BranchesTab() {
   async function handleDelete(code) {
     if (!confirm(`Delete branch "${code}"? Existing logs will be retained.`)) return;
     await deleteBranch(code);
+    try { await deleteBranchFromSheets(code); } catch { /* offline — ok */ }
     load();
   }
 
@@ -977,6 +984,8 @@ function SettingsTab({ branch }) {
         })
       );
       await bulkPushLogsToSheets(enriched);
+      // Mark every pushed log as synced so pressing this button again won't re-send them
+      await Promise.all(unsynced.map((l) => saveLog({ ...l, synced: true })));
       setLogStatus(`Synced ${unsynced.length} record(s) to Google Sheets.`);
     } catch (err) {
       setLogStatus('Sync failed: ' + err.message);
