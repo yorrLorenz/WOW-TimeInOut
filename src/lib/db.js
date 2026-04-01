@@ -1,13 +1,16 @@
 import { openDB } from 'idb';
 
 const DB_NAME = 'timeinout-db';
-const DB_VERSION = 3;
+const DB_VERSION = 5;
 
-const DEFAULT_BRANCHES = [
-  { code: 'MAIN-001', name: 'Main Branch', pin: '1234' },
-  { code: 'NORTH-002', name: 'North Branch', pin: '1234' },
-  { code: 'SOUTH-003', name: 'South Branch', pin: '1234' },
-];
+/** SHA-256 hash of a PIN string → 64-char hex. Uses Web Crypto API. */
+export async function hashPin(pin) {
+  const encoder = new TextEncoder();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(pin));
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
 
 let dbPromise = null;
 
@@ -82,20 +85,57 @@ function getDB() {
           }
         }
 
-        // ── Seed default branches + SUPER-ADMIN ──────────────────────────
-        const branchStore = transaction.objectStore('branches');
-        for (const b of DEFAULT_BRANCHES) {
-          const existing = await branchStore.get(b.code);
-          if (!existing) await branchStore.add(b);
-        }
-        const adminExisting = await branchStore.get('SUPER-ADMIN');
-        if (!adminExisting) {
+        // ── Fresh install: seed SUPER-ADMIN only (branches come from Sheets) ─
+        if (oldVersion === 0) {
+          const branchStore = transaction.objectStore('branches');
+          // Seed with hashed PIN so fresh installs are secure from the start
+          const hashed = await hashPin('admin1234');
           await branchStore.add({
             code: 'SUPER-ADMIN',
             name: 'Super Admin',
-            pin: 'admin1234',
+            pin: hashed,
             isAdmin: true,
           });
+        }
+
+        // ── v3 → v4: remove hardcoded test branches ───────────────────────
+        if (oldVersion < 4 && oldVersion >= 1) {
+          const branchStore = transaction.objectStore('branches');
+          for (const code of ['MAIN-001', 'NORTH-002', 'SOUTH-003']) {
+            const existing = await branchStore.get(code);
+            if (existing) await branchStore.delete(code);
+          }
+        }
+
+        // ── v4 → v5: hash SUPER-ADMIN PIN; backfill uid+name in logs ──────
+        if (oldVersion < 5 && oldVersion >= 1) {
+          // Hash the SUPER-ADMIN PIN if it's still plaintext
+          const branchStore = transaction.objectStore('branches');
+          const admin = await branchStore.get('SUPER-ADMIN');
+          if (admin && admin.pin && !/^[0-9a-f]{64}$/.test(admin.pin)) {
+            await branchStore.put({ ...admin, pin: await hashPin(admin.pin) });
+          }
+
+          // Backfill uid + employeeName into existing logs so they can be
+          // synced even after the employee store is cleared on next startup.
+          const logStore = transaction.objectStore('logs');
+          const empStore = transaction.objectStore('employees');
+          const allEmps  = await empStore.getAll();
+          const idToEmp  = {};
+          for (const e of allEmps) idToEmp[e.id] = e;
+
+          let logCursor = await logStore.openCursor();
+          while (logCursor) {
+            if (!logCursor.value.uid) {
+              const emp = idToEmp[logCursor.value.employeeId];
+              await logCursor.update({
+                ...logCursor.value,
+                uid:          emp?.uid  || '',
+                employeeName: emp?.name || '',
+              });
+            }
+            logCursor = await logCursor.continue();
+          }
         }
       },
     });
@@ -127,17 +167,16 @@ export async function deleteBranch(code) {
 
 /**
  * Merge branches pulled from Sheets into local IndexedDB.
- * - New branch → add it
+ * - New branch → add it (Sheets is source of truth for custom branches)
  * - Existing branch with changed name/PIN → update it
- * - SUPER-ADMIN is never overwritten from remote (security)
  */
 export async function mergeBranchesFromRemote(remoteBranches) {
   let added = 0, updated = 0;
   for (const remote of remoteBranches) {
-    if (!remote.code || remote.code === 'SUPER-ADMIN') continue;
+    if (!remote.code) continue;
     const local = await getBranch(remote.code);
     if (!local) {
-      await saveBranch({ code: remote.code, name: remote.name, pin: remote.pin });
+      await saveBranch({ code: remote.code, name: remote.name, pin: remote.pin, isAdmin: remote.isAdmin ?? false });
       added++;
     } else if (local.name !== remote.name || local.pin !== remote.pin) {
       await saveBranch({ ...local, name: remote.name, pin: remote.pin });
@@ -279,4 +318,22 @@ export async function deleteLog(id) {
 export async function getAllLogs() {
   const db = await getDB();
   return db.getAll('logs');
+}
+
+/**
+ * Clear cached session data on app startup:
+ *   - Entire employees store (re-fetched fresh from Sheets after login)
+ *   - All synced logs (already persisted in Sheets; keep unsynced for retry)
+ * Called once before rendering routes so no stale biometric data sits on disk.
+ */
+export async function clearLocalCacheOnStartup() {
+  const db = await getDB();
+  await db.clear('employees');
+  const tx = db.transaction('logs', 'readwrite');
+  let cursor = await tx.store.openCursor();
+  while (cursor) {
+    if (cursor.value.synced === true) await cursor.delete();
+    cursor = await cursor.continue();
+  }
+  await tx.done;
 }

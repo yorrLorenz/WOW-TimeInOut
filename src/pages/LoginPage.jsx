@@ -1,14 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useBranch } from '../context/BranchContext';
-import { getBranch, saveBranch, mergeBranchesFromRemote } from '../lib/db';
-import { fetchBranchesFromSheets } from '../lib/sheets';
-
-const DEFAULT_BRANCHES = [
-  { code: 'MAIN-001', name: 'Main Branch' },
-  { code: 'NORTH-002', name: 'North Branch' },
-  { code: 'SOUTH-003', name: 'South Branch' },
-];
+import { getBranch, hashPin } from '../lib/db';
+import { fetchBranchesFromSheets, getAppsScriptUrl } from '../lib/sheets';
 
 export default function LoginPage() {
   const { setBranch } = useBranch();
@@ -19,17 +13,6 @@ export default function LoginPage() {
   const [showPin, setShowPin] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-
-  // Silently pull latest branches from Sheets on every login page load
-  // so new/updated branch accounts are available without any admin action.
-  useEffect(() => {
-    (async () => {
-      try {
-        const remote = await fetchBranchesFromSheets();
-        if (remote.length > 0) await mergeBranchesFromRemote(remote);
-      } catch { /* offline or URL not configured — safe to ignore */ }
-    })();
-  }, []);
 
   async function handleLogin(e) {
     e.preventDefault();
@@ -43,29 +26,48 @@ export default function LoginPage() {
         return;
       }
 
-      let account = await getBranch(code);
-
-      // Auto-create known default branches on first run
-      if (!account) {
-        const defaultBranch = DEFAULT_BRANCHES.find((b) => b.code === code);
-        if (defaultBranch) {
-          await saveBranch({ ...defaultBranch, pin: '1234' });
-          account = { ...defaultBranch, pin: '1234' };
+      // SUPER-ADMIN is a system account — always verified locally
+      if (code === 'SUPER-ADMIN') {
+        const admin = await getBranch('SUPER-ADMIN');
+        const hashed = await hashPin(pin);
+        if (!admin || admin.pin !== hashed) {
+          setError('Incorrect admin code or PIN.');
+          return;
         }
+        setBranch({ code: admin.code, name: admin.name, isAdmin: true });
+        navigate('/dashboard');
+        return;
       }
 
+      // All branch accounts are verified live against Google Sheets
+      if (!getAppsScriptUrl()) {
+        setError('This system is not configured yet. Contact your administrator.');
+        return;
+      }
+
+      let branches;
+      try {
+        branches = await fetchBranchesFromSheets();
+      } catch {
+        setError('No internet connection. This app requires an active internet connection to sign in.');
+        return;
+      }
+
+      const account = branches.find((b) => b.code === code);
       if (!account) {
         setError('Account not found. Check your branch code or contact your administrator.');
         return;
       }
 
-      if (account.pin && account.pin !== pin) {
-        setError('Incorrect PIN.');
-        return;
+      if (account.pin) {
+        const hashed = await hashPin(pin);
+        if (account.pin !== hashed) {
+          setError('Incorrect PIN.');
+          return;
+        }
       }
 
       const isAdmin = account.isAdmin ?? false;
-      // Store minimal context — never the PIN
       setBranch({ code: account.code, name: account.name, isAdmin });
       navigate(isAdmin ? '/dashboard' : '/timeinout');
     } catch (err) {
@@ -152,19 +154,9 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <div className="mt-6 p-3 bg-gray-50 rounded-lg text-xs text-gray-500">
-          <p className="font-medium mb-1">Branch codes (default PIN: 1234):</p>
-          {DEFAULT_BRANCHES.map((b) => (
-            <button
-              key={b.code}
-              type="button"
-              onClick={() => setAccountCode(b.code)}
-              className="block hover:text-brand transition-colors"
-            >
-              {b.code} — {b.name} 
-            </button>
-          ))}
-        </div>
+        <p className="mt-6 text-center text-xs text-gray-400">
+          Contact your administrator to obtain your branch code.
+        </p>
       </div>
     </div>
   );

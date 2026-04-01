@@ -4,7 +4,7 @@ import { useCamera } from '../hooks/useCamera';
 import CameraView from '../components/CameraView';
 import { loadModels, detectSingleFaceDescriptor, descriptorToArray } from '../lib/faceApi';
 import { registerEmployee, getAllEmployees, getAllBranches } from '../lib/db';
-import { upsertEmployeeToSheets } from '../lib/sheets';
+import { upsertEmployeeToSheets, bulkSyncEmployeesToSheets } from '../lib/sheets';
 
 const CAPTURE_COUNT = 5; // number of samples per registration
 
@@ -107,12 +107,16 @@ export default function RegisterPage() {
       setCaptures([]);
       await refreshEmployees();
 
-      // Push to EmployeeSync sheet so other branches can pull this employee's face data
+      // Sync to Sheets in background — EmployeeSync (face data) + Employees directory
       try {
-        await upsertEmployeeToSheets({ ...empData, uid });
+        const allEmps = await getAllEmployees();
+        await Promise.all([
+          upsertEmployeeToSheets({ ...empData, uid }),
+          bulkSyncEmployeesToSheets(allEmps),
+        ]);
         setStatus('Employee registered and synced to all branches.');
       } catch {
-        setStatus('Employee registered. Sheets sync failed — use "Push All to Sync Sheet" in Settings.');
+        setStatus('Employee registered. Sheets sync failed — use Settings to sync manually.');
       }
     } catch (err) {
       setStatus('Save failed: ' + err.message);

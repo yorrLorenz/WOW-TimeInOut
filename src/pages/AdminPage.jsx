@@ -17,16 +17,15 @@ import {
   deleteBranch,
 } from '../lib/db';
 import {
-  getAppsScriptUrl, saveAppsScriptUrl,
   pushLogToSheets, updateLogInSheets, bulkPushLogsToSheets,
   bulkSyncEmployeesToSheets, generateMonthlySummaryToSheets,
   upsertEmployeeToSheets, fetchEmployeesFromSheets,
-  upsertBranchToSheets, deleteBranchFromSheets,
+  upsertBranchToSheets, deleteBranchFromSheets, fetchBranchesFromSheets,
   computePeriodSummary, generatePeriodOptions,
   getStandardHours, saveStandardHours,
-  calcDuration,
+  calcDuration, migratePinHashes,
 } from '../lib/sheets';
-import { mergeEmployeesFromRemote } from '../lib/db';
+import { mergeEmployeesFromRemote, mergeBranchesFromRemote, hashPin } from '../lib/db';
 import { useCamera } from '../hooks/useCamera';
 import CameraView from '../components/CameraView';
 import { loadModels, detectSingleFaceDescriptor, descriptorToArray } from '../lib/faceApi';
@@ -115,8 +114,14 @@ function FaceUpdateModal({ employee, onClose, onSaved }) {
     try {
       const updated = { ...employee, descriptors: captures };
       await saveEmployee(updated);
-      // Auto-push updated face data to EmployeeSync so other branches get it
-      try { await upsertEmployeeToSheets(updated); } catch { /* offline — ok */ }
+      // Auto-push updated face data to EmployeeSync + refresh directory
+      try {
+        const allEmps = await getAllEmployees();
+        await Promise.all([
+          upsertEmployeeToSheets(updated),
+          bulkSyncEmployeesToSheets(allEmps),
+        ]);
+      } catch { /* offline — ok */ }
       onSaved();
       onClose();
     } catch (err) {
@@ -208,9 +213,21 @@ function BranchesTab() {
   const [showForm, setShowForm] = useState(false);
   const [status, setStatus] = useState('');
 
+  const [loadError, setLoadError] = useState('');
+
   const load = useCallback(async () => {
-    const all = await getAllBranches();
-    setBranches(all.filter((b) => b.code !== 'SUPER-ADMIN'));
+    setLoadError('');
+    try {
+      const all = await fetchBranchesFromSheets();
+      // Exclude admin-flagged accounts — those are not branch kiosk accounts
+      setBranches(all.filter((b) => !b.isAdmin));
+    } catch (err) {
+      if (err.message?.includes('not configured')) {
+        setLoadError('Apps Script URL not configured. Go to Settings and paste your Web App URL first.');
+      } else {
+        setLoadError('Could not load branches from Google Sheets. Check your internet connection and ensure the Apps Script is deployed.');
+      }
+    }
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -223,7 +240,8 @@ function BranchesTab() {
   }
 
   function openEdit(b) {
-    setForm({ code: b.code, name: b.name, pin: b.pin ?? '' });
+    // Don't load the stored hash into the PIN field — user must re-enter to change it
+    setForm({ code: b.code, name: b.name, pin: '' });
     setEditingCode(b.code);
     setShowForm(true);
     setStatus('');
@@ -235,9 +253,13 @@ function BranchesTab() {
     if (!code || !form.name.trim()) { setStatus('Code and name are required.'); return; }
     if (code === 'SUPER-ADMIN') { setStatus('That code is reserved.'); return; }
     try {
-      const branch = { code, name: form.name.trim(), pin: form.pin.trim() };
-      await saveBranch(branch);
-      try { await upsertBranchToSheets(branch); } catch { /* offline — ok */ }
+      setStatus('Saving…');
+      const rawPin = form.pin.trim();
+      // Hash if a new PIN is provided; send '' when editing without changing PIN
+      // (Code.gs skips the PIN column when it receives an empty string)
+      const hashedPin = rawPin ? await hashPin(rawPin) : '';
+      const branch = { code, name: form.name.trim(), pin: hashedPin, isAdmin: false };
+      await upsertBranchToSheets(branch);
       setStatus(editingCode ? 'Branch updated.' : 'Branch created.');
       setShowForm(false);
       load();
@@ -248,9 +270,12 @@ function BranchesTab() {
 
   async function handleDelete(code) {
     if (!confirm(`Delete branch "${code}"? Existing logs will be retained.`)) return;
-    await deleteBranch(code);
-    try { await deleteBranchFromSheets(code); } catch { /* offline — ok */ }
-    load();
+    try {
+      await deleteBranchFromSheets(code);
+      load();
+    } catch (err) {
+      alert('Delete failed: ' + err.message);
+    }
   }
 
   return (
@@ -264,6 +289,9 @@ function BranchesTab() {
           + New Branch
         </button>
       </div>
+      {loadError && (
+        <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-4">{loadError}</p>
+      )}
 
       {showForm && (
         <form onSubmit={handleSave} className="bg-brand-light border border-brand-border rounded-xl p-4 mb-4 space-y-3 max-w-md">
@@ -285,7 +313,7 @@ function BranchesTab() {
           />
           <input
             type="password"
-            placeholder="PIN"
+            placeholder={editingCode ? 'PIN (leave blank to keep current)' : 'PIN'}
             value={form.pin}
             onChange={(e) => setForm((f) => ({ ...f, pin: e.target.value }))}
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
@@ -321,8 +349,8 @@ function BranchesTab() {
                 <tr key={b.code} className="hover:bg-gray-50">
                   <td className="px-4 py-3 font-mono text-gray-600">{b.code}</td>
                   <td className="px-4 py-3 font-medium text-gray-800">{b.name}</td>
-                  <td className="px-4 py-3 text-gray-400 tracking-widest">
-                    {'•'.repeat(b.pin?.length ?? 0)}
+                  <td className="px-4 py-3 text-gray-400 text-xs">
+                    {b.pin ? '••••••••' : '—'}
                   </td>
                   <td className="px-4 py-3 flex gap-3">
                     <button onClick={() => openEdit(b)}
@@ -370,6 +398,8 @@ function EmployeesTab({ branch }) {
     if (!confirm('Delete this employee and all their face data?')) return;
     await deleteEmployee(id);
     load();
+    // Auto-sync directory after delete
+    try { const emps = await getAllEmployees(); await bulkSyncEmployeesToSheets(emps); } catch { /* offline */ }
   }
 
   const visible = isSuperAdmin && filterBranch !== 'ALL'
@@ -703,18 +733,21 @@ function ManualEntryTab({ branch }) {
       const emp        = employees.find((em) => String(em.id) === String(employeeId));
       const timeInISO  = new Date(`${date}T${timeIn}:00`).toISOString();
       const timeOutISO = includeOut ? new Date(`${date}T${timeOut}:00`).toISOString() : null;
-      await addLog({
-        employeeId: Number(employeeId),
-        branchCode: logBranch,
-        branchIn:   logBranch,
-        branchOut:  includeOut ? logBranch : null,
+      const logData = {
+        employeeId:   Number(employeeId),
+        uid:          emp?.uid          || '',
+        employeeName: emp?.name         || '',
+        branchCode:   logBranch,
+        branchIn:     logBranch,
+        branchOut:    includeOut ? logBranch : null,
         date,
         timeIn:  timeInISO,
         timeOut: timeOutISO,
         synced:  false,
         manual:  true,
         note:    note.trim(),
-      });
+      };
+      const logId = await addLog(logData);
       setStatus('Log entry added — syncing to Sheets…');
       setEmployeeId('');
       setNote('Manual entry');
@@ -730,9 +763,10 @@ function ManualEntryTab({ branch }) {
           branchOut: includeOut ? logBranch : '',
           duration:  timeOutISO ? calcDuration(timeInISO, timeOutISO) : '',
         });
+        await saveLog({ ...logData, id: logId, synced: true });
         setStatus('Log entry added and synced to Google Sheets.');
       } catch {
-        setStatus('Log entry added. Sheets sync failed — saved locally.');
+        setStatus('Log entry added. Sheets sync failed — will retry automatically.');
       }
     } catch (err) {
       setStatus('Error: ' + err.message);
@@ -752,7 +786,8 @@ function ManualEntryTab({ branch }) {
         setTimeoutStatus('Time-out must be after time-in.');
         return;
       }
-      await saveLog({ ...log, timeOut: timeOutISO, branchOut, synced: false, note: timeoutNote.trim() });
+      const updatedLog = { ...log, timeOut: timeOutISO, branchOut, synced: false, note: timeoutNote.trim() };
+      await saveLog(updatedLog);
       setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime} — syncing…`);
       setTimeoutLogId('');
       await loadOpenLogs();
@@ -767,9 +802,10 @@ function ManualEntryTab({ branch }) {
           branchOut,
           duration:     calcDuration(log.timeIn, timeOutISO),
         });
+        await saveLog({ ...updatedLog, synced: true });
         setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime} — synced to Google Sheets.`);
       } catch {
-        setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime}. Sheets sync failed — saved locally.`);
+        setTimeoutStatus(`Timed out ${log.employeeName} at ${timeoutTime}. Sheets sync failed — will retry automatically.`);
       }
     } catch (err) {
       setTimeoutStatus('Error: ' + err.message);
@@ -933,7 +969,6 @@ function SettingsTab({ branch }) {
 
   const periodOptions = generatePeriodOptions();
 
-  const [url,            setUrl]            = useState(getAppsScriptUrl());
   const [stdHours,       setStdHours]       = useState(getStandardHours());
   const [syncing,        setSyncing]        = useState(false);
   const [logStatus,      setLogStatus]      = useState('');
@@ -942,17 +977,14 @@ function SettingsTab({ branch }) {
   const [pullSyncing,    setPullSyncing]    = useState(false);
   const [pullStatus,     setPullStatus]     = useState('');
   const [pushSyncing,    setPushSyncing]    = useState(false);
+  const [pinMigrating,   setPinMigrating]   = useState(false);
+  const [pinMigStatus,   setPinMigStatus]   = useState('');
   const [pushStatus,     setPushStatus]     = useState('');
   const [selectedPeriod, setSelectedPeriod] = useState(0);   // index into periodOptions
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryStatus,  setSummaryStatus]  = useState('');
 
-  function handleSaveUrl() {
-    saveAppsScriptUrl(url.trim());
-    setLogStatus('Apps Script URL saved.');
-  }
-
-  function handleSaveStdHours() {
+function handleSaveStdHours() {
     const h = Number(stdHours);
     if (h > 0 && h <= 24) { saveStandardHours(h); setSummaryStatus('Standard hours saved.'); }
   }
@@ -1064,51 +1096,55 @@ function SettingsTab({ branch }) {
     }
   }
 
+  async function handleMigratePins() {
+    setPinMigrating(true);
+    setPinMigStatus('');
+    try {
+      await migratePinHashes();
+      setPinMigStatus('Done. All plaintext PINs in Google Sheets have been hashed. You only need to run this once.');
+    } catch (err) {
+      setPinMigStatus('Failed: ' + err.message);
+    } finally {
+      setPinMigrating(false);
+    }
+  }
+
   const btnClass  = 'text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors';
   const statusBox = 'text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2';
 
   return (
     <div className="max-w-lg space-y-8">
 
-      {/* ── Apps Script URL ── */}
-      <div>
-        <h2 className="font-semibold text-gray-700 mb-1">Google Sheets — Apps Script URL</h2>
-        <p className="text-xs text-gray-500 mb-3">
-          Deploy <code className="bg-gray-100 px-1 rounded">apps-script/Code.gs</code> as a Web App and paste the URL here.
+
+      {/* ── Auto-sync notice ── */}
+      <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-3">
+        <p className="text-sm font-medium text-green-800 mb-0.5">Automatic sync is active</p>
+        <p className="text-xs text-green-700">
+          Attendance logs, employee data, and monthly summaries sync to Google Sheets automatically after every action.
+          Use the buttons below only if something went wrong or you need to force a manual refresh.
         </p>
-        <div className="flex gap-2">
-          <input
-            type="url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://script.google.com/macros/s/…/exec"
-            className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"
-          />
-          <button onClick={handleSaveUrl} className={`bg-brand hover:bg-brand-dark ${btnClass}`}>Save</button>
-        </div>
-        {logStatus && <p className={`mt-2 ${statusBox}`}>{logStatus}</p>}
       </div>
 
       {/* ── Bulk sync attendance logs ── */}
       <div>
         <h2 className="font-semibold text-gray-700 mb-1">
-          Sync Offline Attendance Logs {isSuperAdmin ? '(All Branches)' : ''}
+          Force Sync Offline Logs {isSuperAdmin ? '(All Branches)' : ''}
         </h2>
-        <p className="text-xs text-gray-500 mb-3">Pushes any logs that failed to sync in real-time.</p>
+        <p className="text-xs text-gray-500 mb-3">Runs automatically on every Time In/Out. Use this only if records are missing from Sheets.</p>
         <button onClick={handleBulkSync} disabled={syncing} className={`bg-green-600 hover:bg-green-700 ${btnClass}`}>
-          {syncing ? 'Syncing…' : 'Sync Offline Logs'}
+          {syncing ? 'Syncing…' : 'Force Sync Offline Logs'}
         </button>
+        {logStatus && <p className={`mt-2 ${statusBox}`}>{logStatus}</p>}
       </div>
 
       {/* ── Employee directory sync ── */}
       <div className="border-t border-gray-100 pt-6">
-        <h2 className="font-semibold text-gray-700 mb-1">Sync Employee Directory</h2>
+        <h2 className="font-semibold text-gray-700 mb-1">Force Sync Employee Directory</h2>
         <p className="text-xs text-gray-500 mb-3">
-          Writes all employees to the <strong>Employees</strong> sheet (UID, Name, Position, Branch, Face Status, Created At).
-          Face recognition data cannot be stored in a spreadsheet — only registration status is shown.
+          Runs automatically after every registration or deletion. Use this only if the <strong>Employees</strong> sheet looks out of date.
         </p>
         <button onClick={handleSyncEmployees} disabled={empSyncing} className={`bg-brand hover:bg-brand-dark ${btnClass}`}>
-          {empSyncing ? 'Syncing…' : 'Sync Employees to Sheets'}
+          {empSyncing ? 'Syncing…' : 'Force Sync Employees to Sheets'}
         </button>
         {empStatus && <p className={`mt-2 ${statusBox}`}>{empStatus}</p>}
       </div>
@@ -1117,9 +1153,9 @@ function SettingsTab({ branch }) {
       <div className="border-t border-gray-100 pt-6">
         <h2 className="font-semibold text-gray-700 mb-1">Cross-Branch Employee Sync</h2>
         <p className="text-xs text-gray-500 mb-4">
-          The <strong>EmployeeSync</strong> sheet is the shared database for all branches.
-          Face data is automatically pushed here when an employee registers.
-          Use these buttons for initial setup or when setting up a new branch kiosk.
+          Face data syncs automatically when an employee registers or updates their face.
+          Each kiosk pulls the latest data on startup.
+          Use these buttons only for initial setup or after manually editing the sheet.
         </p>
 
         <div className="space-y-4">
@@ -1127,10 +1163,10 @@ function SettingsTab({ branch }) {
           <div>
             <p className="text-sm font-medium text-gray-700 mb-1">Pull from Sheets → this device</p>
             <p className="text-xs text-gray-400 mb-2">
-              Imports employees from EmployeeSync into this kiosk. Run this on a new branch PC or after adding employees manually to the sheet.
+              Force-import employees from EmployeeSync. Normally happens automatically on kiosk startup.
             </p>
             <button onClick={handlePullFromSheets} disabled={pullSyncing} className={`bg-blue-600 hover:bg-blue-700 ${btnClass}`}>
-              {pullSyncing ? 'Pulling…' : 'Pull Employees from Sheets'}
+              {pullSyncing ? 'Pulling…' : 'Force Pull Employees from Sheets'}
             </button>
             {pullStatus && <p className={`mt-2 ${statusBox}`}>{pullStatus}</p>}
           </div>
@@ -1152,10 +1188,10 @@ function SettingsTab({ branch }) {
 
       {/* ── Monthly summary ── */}
       <div className="border-t border-gray-100 pt-6">
-        <h2 className="font-semibold text-gray-700 mb-1">Generate Monthly Summary</h2>
+        <h2 className="font-semibold text-gray-700 mb-1">Monthly Summary</h2>
         <p className="text-xs text-gray-500 mb-3">
-          Computes per-employee totals for a 15-day period and writes them to the <strong>Monthly Summary</strong> sheet.
-          Existing rows for the chosen period are replaced.
+          The current period updates automatically every time an employee completes a full day.
+          Use this to manually regenerate a specific period or a past period.
         </p>
 
         <div className="space-y-3">
@@ -1200,6 +1236,20 @@ function SettingsTab({ branch }) {
           <p><strong>Undertime Days</strong> — days where total hours &lt; standard hours/day (but &gt; 0)</p>
           <p><strong>Total Hours</strong> — sum of all duration hours for the period</p>
         </div>
+      </div>
+
+      {/* ── One-time PIN hash migration ── */}
+      <div className="border-t border-gray-100 pt-6">
+        <h2 className="font-semibold text-gray-700 mb-1">Migrate PIN Hashes</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Run this <strong>once</strong> after deploying the updated Code.gs to hash any existing
+          plaintext PINs in Google Sheets. New branches are hashed automatically — this only
+          affects branches created before the security update. Safe to run multiple times.
+        </p>
+        <button onClick={handleMigratePins} disabled={pinMigrating} className={`bg-amber-600 hover:bg-amber-700 ${btnClass}`}>
+          {pinMigrating ? 'Migrating…' : 'Migrate PIN Hashes in Sheets'}
+        </button>
+        {pinMigStatus && <p className={`mt-2 ${statusBox}`}>{pinMigStatus}</p>}
       </div>
 
     </div>

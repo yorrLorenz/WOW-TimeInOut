@@ -12,18 +12,17 @@ import {
 import {
   getAllEmployees,
   getAllLogs,
-  getTodayLogForEmployee,
   addLog,
   saveLog,
   todayDateString,
 } from '../lib/db';
 import {
-  pushLogToSheets, updateLogInSheets, calcDuration,
+  pushLogToSheets, updateLogInSheets, bulkPushLogsToSheets, calcDuration,
   computePeriodSummary, generateMonthlySummaryToSheets,
   generatePeriodOptions, getStandardHours,
   fetchEmployeesFromSheets,
 } from '../lib/sheets';
-import { mergeEmployeesFromRemote } from '../lib/db';
+import { mergeEmployeesFromRemote, getEmployee } from '../lib/db';
 
 const SCAN_INTERVAL_MS     = 100;
 
@@ -74,6 +73,49 @@ function getHeadTurnRatio(landmarks) {
   return dist(noseTip, leftCenter) / dist(noseTip, rightCenter);
 }
 
+const fmtTime = (iso) =>
+  iso ? new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+
+/**
+ * Determine which actions are available for an employee based on today's log.
+ * Returns { timeIn, timeOut, lunch } — each with { enabled, reason, label?, action? }.
+ */
+function computeActions(todayLog, hasOpenPrevious) {
+  if (!todayLog) {
+    return {
+      timeIn:  { enabled: !hasOpenPrevious, reason: hasOpenPrevious ? 'Unfinished entry from a previous day — ask admin to correct it first.' : null },
+      timeOut: { enabled: false, reason: 'Not timed in yet today.' },
+      lunch:   { enabled: false, label: 'Lunch Break', action: null, reason: 'Not timed in yet today.' },
+    };
+  }
+  if (todayLog.timeOut) {
+    return {
+      timeIn:  { enabled: false, reason: 'Already completed today.' },
+      timeOut: { enabled: false, reason: 'Already timed out today.' },
+      lunch:   { enabled: false, label: 'Lunch Break', action: null, reason: 'Day already complete.' },
+    };
+  }
+  const onBreak  = !!todayLog.lunchStart && !todayLog.lunchEnd;
+  const breakDone = !!todayLog.lunchStart && !!todayLog.lunchEnd;
+  return {
+    timeIn:  { enabled: false, reason: 'Already timed in today.' },
+    timeOut: { enabled: !onBreak, reason: onBreak ? 'End your lunch break first.' : null },
+    lunch:   onBreak
+      ? { enabled: true,  label: 'End Lunch Break',  action: 'endLunch',   reason: null }
+      : breakDone
+        ? { enabled: false, label: 'Lunch Break', action: null, reason: 'Lunch break already taken today.' }
+        : { enabled: true,  label: 'Lunch Break',    action: 'startLunch', reason: null },
+  };
+}
+
+/** One-line status text shown on the confirmation card. */
+function getStatusLine(todayLog) {
+  if (!todayLog) return 'Not timed in today.';
+  if (todayLog.timeOut) return `Completed — ${fmtTime(todayLog.timeIn)} to ${fmtTime(todayLog.timeOut)}`;
+  if (todayLog.lunchStart && !todayLog.lunchEnd) return `On lunch break since ${fmtTime(todayLog.lunchStart)}`;
+  return `Timed in at ${fmtTime(todayLog.timeIn)}`;
+}
+
 // ── Page component ────────────────────────────────────────────────────────────
 
 export default function TimeInOutPage() {
@@ -119,20 +161,83 @@ export default function TimeInOutPage() {
       await loadModels();
       setModelsReady(true);
       await refreshEmployees();
-      // Background: silently pull latest face data from EmployeeSync sheet
-      // so kiosks stay up-to-date without any admin action required.
+      // Background tasks — run silently after models are ready
       (async () => {
         try {
+          // Pull latest face data from EmployeeSync (cross-branch recognition)
           const remote = await fetchEmployeesFromSheets();
           if (remote.length > 0) {
             const { added, updated } = await mergeEmployeesFromRemote(remote);
             if (added + updated > 0) await refreshEmployees();
           }
-        } catch { /* no Apps Script URL configured or offline — safe to ignore */ }
+        } catch { /* offline or URL not configured */ }
+        // Push any logs that failed to sync in a previous session
+        await syncOfflineLogs();
       })();
     }
     init();
   }, []);
+
+  // Silently push any unsynced logs — called on mount and after each Time In/Out.
+  // Completed logs (have timeOut) use updateLog so they patch the existing row.
+  // Time-In-only logs use bulkAddLogs (append).
+  async function syncOfflineLogs() {
+    try {
+      const logs     = await getAllLogs();
+      const unsynced = logs.filter((l) => !l.synced);
+      if (unsynced.length === 0) return;
+
+      const completed  = unsynced.filter((l) => l.timeOut);   // Time Out done
+      const timeinOnly = unsynced.filter((l) => !l.timeOut);  // Time In only
+
+      // Update completed logs one at a time (must match existing row by UID+date)
+      for (const l of completed) {
+        const emp = l.uid ? null : await getEmployee(l.employeeId);
+        try {
+          await updateLogInSheets({
+            uid:           l.uid          || emp?.uid  || '',
+            employeeName:  l.employeeName || emp?.name || `#${l.employeeId}`,
+            date:          l.date,
+            timeIn:        l.timeIn  ? new Date(l.timeIn).toLocaleTimeString()  : '',
+            timeOut:       l.timeOut ? new Date(l.timeOut).toLocaleTimeString() : '',
+            branchIn:      l.branchIn  ?? l.branchCode ?? '',
+            branchOut:     l.branchOut ?? '',
+            duration:      calcDuration(l.timeIn, l.timeOut),
+            lunchStart:    l.lunchStart    ? new Date(l.lunchStart).toLocaleTimeString()    : '',
+            lunchEnd:      l.lunchEnd      ? new Date(l.lunchEnd).toLocaleTimeString()      : '',
+            lunchDuration: l.lunchDuration || '',
+          });
+          await saveLog({ ...l, synced: true });
+        } catch { /* still offline — leave synced:false, will retry */ }
+      }
+
+      // Bulk-append Time-In-only logs
+      if (timeinOnly.length > 0) {
+        const enriched = await Promise.all(
+          timeinOnly.map(async (l) => {
+            const emp = l.uid ? null : await getEmployee(l.employeeId);
+            return {
+              uid:           l.uid          || emp?.uid  || '',
+              employeeName:  l.employeeName || emp?.name || `#${l.employeeId}`,
+              date:          l.date,
+              timeIn:        l.timeIn ? new Date(l.timeIn).toLocaleTimeString() : '',
+              timeOut:       '',
+              branchIn:      l.branchIn ?? l.branchCode ?? '',
+              branchOut:     '',
+              duration:      '',
+              lunchStart:    l.lunchStart    ? new Date(l.lunchStart).toLocaleTimeString()    : '',
+              lunchEnd:      l.lunchEnd      ? new Date(l.lunchEnd).toLocaleTimeString()      : '',
+              lunchDuration: l.lunchDuration || '',
+            };
+          })
+        );
+        try {
+          await bulkPushLogsToSheets(enriched);
+          await Promise.all(timeinOnly.map((l) => saveLog({ ...l, synced: true })));
+        } catch { /* offline — will retry next time */ }
+      }
+    } catch { /* offline — will retry next time */ }
+  }
 
   async function refreshEmployees() {
     const list = await getAllEmployees();
@@ -236,14 +341,12 @@ export default function TimeInOutPage() {
       const emp = employeesRef.current.find((e) => String(e.id) === match.label);
       if (!emp) { tickRunningRef.current = false; return; }
 
-      const existingLog = await getTodayLogForEmployee(emp.id);
-      const proposedAction = !existingLog
-        ? 'Time In'
-        : !existingLog.timeOut
-        ? 'Time Out'
-        : 'Already Complete';
+      const today    = todayDateString();
+      const allLogs  = await getAllLogs();
+      const todayLog = allLogs.find((l) => l.uid === emp.uid && l.date === today) ?? null;
+      const hasOpenPrevious = allLogs.some((l) => l.uid === emp.uid && !l.timeOut && l.date !== today);
 
-      setPending({ employee: emp, proposedAction, existingLog });
+      setPending({ employee: emp, todayLog, hasOpenPrevious });
       setMessage('');
     } catch (err) {
       setMessage('Scan error: ' + err.message);
@@ -284,86 +387,116 @@ export default function TimeInOutPage() {
 
   useEffect(() => () => clearInterval(intervalRef.current), []);
 
-  // ── Confirmation handlers ─────────────────────────────────────────────────
+  // ── Action handlers ───────────────────────────────────────────────────────
 
-  async function handleConfirm() {
-    if (!pending) return;
-    const { employee: emp, proposedAction, existingLog } = pending;
+  async function handleAction(actionType) {
+    if (!pending || !actionType) return;
+    const { employee: emp, todayLog } = pending;
     const today = todayDateString();
     const now   = new Date().toISOString();
 
+    let savedLog      = null;
     let sheetsPayload = null;
-    let sheetsFn      = pushLogToSheets;   // 'add' for Time In, 'update' for Time Out
-    let savedLog      = null;              // full log object written to DB (for marking synced)
+    let sheetsFn      = null;
+    let resultAction  = '';
+    let resultExtra   = '';
 
-    if (proposedAction === 'Time In') {
+    if (actionType === 'timeIn') {
       const logData = {
-        employeeId: emp.id,
-        branchCode: branch.code,
-        branchIn:   branch.code,
-        branchOut:  null,
-        date:       today,
-        timeIn:     now,
-        timeOut:    null,
-        synced:     false,
+        employeeId:   emp.id,
+        uid:          emp.uid || `#${emp.id}`,
+        employeeName: emp.name,
+        branchCode:   branch.code,
+        branchIn:     branch.code,
+        branchOut:    null,
+        date:         today,
+        timeIn:       now,
+        timeOut:      null,
+        synced:       false,
       };
       const logId = await addLog(logData);
       savedLog = { ...logData, id: logId };
       sheetsPayload = {
-        uid:          emp.uid || `#${emp.id}`,
-        employeeName: emp.name,
-        date:         today,
-        timeIn:       new Date(now).toLocaleTimeString(),
-        timeOut:      '',
-        branchIn:     branch.code,
-        branchOut:    '',
-        duration:     '',
+        uid: emp.uid || `#${emp.id}`, employeeName: emp.name, date: today,
+        timeIn: new Date(now).toLocaleTimeString(), timeOut: '',
+        branchIn: branch.code, branchOut: '', duration: '',
+        lunchStart: '', lunchEnd: '', lunchDuration: '',
       };
-    } else if (proposedAction === 'Time Out') {
-      savedLog = { ...existingLog, timeOut: now, branchOut: branch.code, synced: false };
+      sheetsFn     = pushLogToSheets;
+      resultAction = 'Time In';
+
+    } else if (actionType === 'timeOut') {
+      const duration = calcDuration(todayLog.timeIn, now);
+      savedLog = { ...todayLog, timeOut: now, branchOut: branch.code, synced: false };
       await saveLog(savedLog);
       sheetsPayload = {
-        uid:          emp.uid || `#${emp.id}`,
-        employeeName: emp.name,
-        date:         today,
-        timeIn:       new Date(savedLog.timeIn).toLocaleTimeString(),
-        timeOut:      new Date(now).toLocaleTimeString(),
-        branchIn:     savedLog.branchIn ?? savedLog.branchCode,
-        branchOut:    branch.code,
-        duration:     calcDuration(savedLog.timeIn, now),
+        uid: emp.uid || `#${emp.id}`, employeeName: emp.name, date: today,
+        timeIn:   new Date(todayLog.timeIn).toLocaleTimeString(),
+        timeOut:  new Date(now).toLocaleTimeString(),
+        branchIn: todayLog.branchIn ?? todayLog.branchCode,
+        branchOut: branch.code, duration,
+        lunchStart:    todayLog.lunchStart    ? new Date(todayLog.lunchStart).toLocaleTimeString()    : '',
+        lunchEnd:      todayLog.lunchEnd      ? new Date(todayLog.lunchEnd).toLocaleTimeString()      : '',
+        lunchDuration: todayLog.lunchDuration || '',
       };
-      sheetsFn = updateLogInSheets;  // update the existing row, not append
+      sheetsFn     = updateLogInSheets;
+      resultAction = 'Time Out';
+      resultExtra  = `Working time: ${duration}`;
+
+    } else if (actionType === 'startLunch') {
+      savedLog = { ...todayLog, lunchStart: now, synced: false };
+      await saveLog(savedLog);
+      sheetsPayload = {
+        uid: emp.uid || `#${emp.id}`, employeeName: emp.name, date: today,
+        timeIn: new Date(todayLog.timeIn).toLocaleTimeString(), timeOut: '',
+        branchIn: todayLog.branchIn ?? todayLog.branchCode, branchOut: '', duration: '',
+        lunchStart: new Date(now).toLocaleTimeString(), lunchEnd: '', lunchDuration: '',
+      };
+      sheetsFn     = updateLogInSheets;
+      resultAction = 'Lunch Break';
+      resultExtra  = 'Break started — tap End Lunch when you return.';
+
+    } else if (actionType === 'endLunch') {
+      const lunchDuration = calcDuration(todayLog.lunchStart, now);
+      savedLog = { ...todayLog, lunchEnd: now, lunchDuration, synced: false };
+      await saveLog(savedLog);
+      sheetsPayload = {
+        uid: emp.uid || `#${emp.id}`, employeeName: emp.name, date: today,
+        timeIn: new Date(todayLog.timeIn).toLocaleTimeString(), timeOut: '',
+        branchIn: todayLog.branchIn ?? todayLog.branchCode, branchOut: '', duration: '',
+        lunchStart:    new Date(todayLog.lunchStart).toLocaleTimeString(),
+        lunchEnd:      new Date(now).toLocaleTimeString(),
+        lunchDuration,
+      };
+      sheetsFn     = updateLogInSheets;
+      resultAction = 'Break Ended';
+      resultExtra  = `Break duration: ${lunchDuration}`;
     }
 
     // Show result card immediately — don't wait for Sheets
     setLastResult({
-      name:       emp.name,
-      uid:        emp.uid || `#${emp.id}`,
-      action:     proposedAction,
-      time:       new Date().toLocaleTimeString(),
+      name: emp.name, uid: emp.uid || `#${emp.id}`,
+      action: resultAction, extra: resultExtra,
+      time: new Date().toLocaleTimeString(),
       syncStatus: sheetsPayload ? 'syncing' : 'idle',
     });
     setPending(null);
 
-    // Push/update Sheets in the background and update sync status
     if (sheetsPayload && savedLog) {
       try {
         await sheetsFn(sheetsPayload);
-        // Mark log as synced so "Sync Offline Logs" won't re-send it
         await saveLog({ ...savedLog, synced: true });
         setLastResult((r) => ({ ...r, syncStatus: 'synced' }));
+        syncOfflineLogs();
 
-        // Q3: After a completed Time Out, silently refresh the current period summary
-        if (proposedAction === 'Time Out') {
+        if (actionType === 'timeOut') {
           (async () => {
             try {
-              const [allLogs, allEmps] = await Promise.all([getAllLogs(), getAllEmployees()]);
+              const [logs, emps] = await Promise.all([getAllLogs(), getAllEmployees()]);
               const [period] = generatePeriodOptions();
-              const rows = computePeriodSummary(
-                allLogs, allEmps, period.year, period.month, period.half, getStandardHours()
-              );
+              const rows = computePeriodSummary(logs, emps, period.year, period.month, period.half, getStandardHours());
               if (rows.length > 0) await generateMonthlySummaryToSheets(period.label, rows);
-            } catch { /* non-critical — summary will be regenerated manually if needed */ }
+            } catch { /* non-critical */ }
           })();
         }
       } catch {
@@ -386,9 +519,7 @@ export default function TimeInOutPage() {
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold text-gray-800 mb-2">Time In / Out</h1>
-      <p className="text-sm text-gray-500 mb-6">
-        {branch.name} &bull; {employees.length} employee(s) registered
-      </p>
+      <p className="text-sm text-gray-500 mb-6">{branch.name}</p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Camera column */}
@@ -479,87 +610,117 @@ export default function TimeInOutPage() {
         {/* Right column */}
         <div className="flex flex-col gap-4">
 
-          {/* Confirmation card */}
-          {pending && (
-            <div className="rounded-xl p-6 bg-white border-2 border-brand shadow-md text-center">
-              <p className="text-xs font-semibold text-brand uppercase tracking-wide mb-3">
-                Confirm Identity
-              </p>
-              <div className="w-16 h-16 rounded-full bg-brand-light flex items-center justify-center text-brand font-bold text-2xl mx-auto mb-3">
-                {pending.employee.name[0].toUpperCase()}
-              </div>
-              <p className="text-xl font-bold text-gray-800">{pending.employee.name}</p>
-              <p className="text-xs text-gray-400 mt-0.5">{pending.employee.uid}</p>
+          {/* Confirmation card — employee manually picks their action */}
+          {pending && (() => {
+            const actions = computeActions(pending.todayLog, pending.hasOpenPrevious);
+            return (
+              <div className="rounded-xl p-5 bg-white border-2 border-brand shadow-md">
+                <p className="text-xs font-semibold text-brand uppercase tracking-wide mb-4 text-center">
+                  Identity Confirmed
+                </p>
 
-              {pending.proposedAction === 'Already Complete' ? (
-                <div className="mt-3 bg-gray-50 border border-gray-200 rounded-lg px-4 py-2">
-                  <p className="text-sm text-gray-500">Already timed in and out today.</p>
+                <div className="text-center mb-3">
+                  <div className="w-14 h-14 rounded-full bg-brand-light flex items-center justify-center text-brand font-bold text-2xl mx-auto mb-2">
+                    {pending.employee.name[0].toUpperCase()}
+                  </div>
+                  <p className="text-lg font-bold text-gray-800">{pending.employee.name}</p>
+                  <p className="text-xs text-gray-400 mt-0.5">{pending.employee.uid}</p>
                 </div>
-              ) : (
-                <div className={`mt-3 inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1 rounded-full ${
-                  pending.proposedAction === 'Time In'
-                    ? 'bg-brand-light text-brand'
-                    : 'bg-green-100 text-green-700'
-                }`}>
-                  {pending.proposedAction === 'Time In' ? '→ Time In' : '← Time Out'}
-                </div>
-              )}
 
-              <div className="flex gap-2 mt-5">
-                {pending.proposedAction !== 'Already Complete' && (
-                  <button
-                    onClick={handleConfirm}
-                    className="flex-1 bg-brand hover:bg-brand-dark text-white font-semibold py-2 rounded-lg text-sm transition-colors"
-                  >
-                    Confirm
-                  </button>
-                )}
+                <div className="text-center text-xs text-gray-500 bg-gray-50 rounded-lg px-3 py-1.5 mb-4">
+                  {getStatusLine(pending.todayLog)}
+                </div>
+
+                <div className="space-y-2">
+                  {/* Time In */}
+                  <div>
+                    <button
+                      onClick={() => handleAction('timeIn')}
+                      disabled={!actions.timeIn.enabled}
+                      className="w-full bg-brand hover:bg-brand-dark text-white font-semibold py-2 rounded-lg text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      Time In
+                    </button>
+                    {!actions.timeIn.enabled && actions.timeIn.reason && (
+                      <p className="text-xs text-gray-400 mt-0.5 text-center">{actions.timeIn.reason}</p>
+                    )}
+                  </div>
+
+                  {/* Time Out */}
+                  <div>
+                    <button
+                      onClick={() => handleAction('timeOut')}
+                      disabled={!actions.timeOut.enabled}
+                      className="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2 rounded-lg text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      Time Out
+                    </button>
+                    {!actions.timeOut.enabled && actions.timeOut.reason && (
+                      <p className="text-xs text-gray-400 mt-0.5 text-center">{actions.timeOut.reason}</p>
+                    )}
+                  </div>
+
+                  {/* Lunch Break */}
+                  <div>
+                    <button
+                      onClick={() => handleAction(actions.lunch.action)}
+                      disabled={!actions.lunch.enabled}
+                      className="w-full bg-amber-500 hover:bg-amber-600 text-white font-semibold py-2 rounded-lg text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      {actions.lunch.label}
+                    </button>
+                    {!actions.lunch.enabled && actions.lunch.reason && (
+                      <p className="text-xs text-gray-400 mt-0.5 text-center">{actions.lunch.reason}</p>
+                    )}
+                  </div>
+                </div>
+
                 <button
                   onClick={handleCancelConfirm}
-                  className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2 rounded-lg text-sm transition-colors"
+                  className="w-full mt-3 bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold py-2 rounded-lg text-sm transition-colors"
                 >
-                  Not me
+                  Not me / Cancel
                 </button>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Result card */}
           {!pending && lastResult && (
             <div className={`rounded-xl p-6 text-center shadow-sm ${
-              lastResult.action === 'Time In'
-                ? 'bg-brand-light border border-brand-border'
-                : lastResult.action === 'Time Out'
-                ? 'bg-green-50 border border-green-200'
-                : 'bg-gray-50 border border-gray-200'
+              lastResult.action === 'Time In'    ? 'bg-brand-light border border-brand-border'
+              : lastResult.action === 'Time Out' ? 'bg-green-50 border border-green-200'
+              : lastResult.action === 'Lunch Break' || lastResult.action === 'Break Ended'
+                                                 ? 'bg-amber-50 border border-amber-200'
+              : 'bg-gray-50 border border-gray-200'
             }`}>
               <div className="text-4xl mb-2">
-                {lastResult.action === 'Time In' ? '✅' : lastResult.action === 'Time Out' ? '👋' : 'ℹ️'}
+                {lastResult.action === 'Time In'     ? '✅'
+                : lastResult.action === 'Time Out'   ? '👋'
+                : lastResult.action === 'Lunch Break'? '☕'
+                : lastResult.action === 'Break Ended'? '✅'
+                : 'ℹ️'}
               </div>
               <p className="text-xl font-bold text-gray-800">{lastResult.name}</p>
               <p className="text-xs text-gray-400 mt-0.5">{lastResult.uid}</p>
               <p className={`text-lg font-semibold mt-2 ${
-                lastResult.action === 'Time In'
-                  ? 'text-brand'
-                  : lastResult.action === 'Time Out'
-                  ? 'text-green-700'
-                  : 'text-gray-500'
+                lastResult.action === 'Time In'      ? 'text-brand'
+                : lastResult.action === 'Time Out'   ? 'text-green-700'
+                : lastResult.action === 'Lunch Break'|| lastResult.action === 'Break Ended'
+                                                     ? 'text-amber-600'
+                : 'text-gray-500'
               }`}>
                 {lastResult.action}
               </p>
               <p className="text-sm text-gray-500 mt-1">{lastResult.time}</p>
+              {lastResult.extra && (
+                <p className="text-sm text-gray-500 mt-0.5">{lastResult.extra}</p>
+              )}
 
-              {/* Sheets sync status */}
               <div className="mt-2 text-xs">
-                {lastResult.syncStatus === 'syncing' && (
-                  <span className="text-gray-400">Syncing to Google Sheets…</span>
-                )}
-                {lastResult.syncStatus === 'synced' && (
-                  <span className="text-green-600 font-medium">✓ Synced to Google Sheets</span>
-                )}
-                {lastResult.syncStatus === 'failed' && (
-                  <span className="text-amber-600 font-medium">⚠ Saved locally — will sync when online</span>
-                )}
+                {lastResult.syncStatus === 'syncing' && <span className="text-gray-400">Syncing to Google Sheets…</span>}
+                {lastResult.syncStatus === 'synced'  && <span className="text-green-600 font-medium">✓ Synced to Google Sheets</span>}
+                {lastResult.syncStatus === 'failed'  && <span className="text-amber-600 font-medium">⚠ Saved locally — will sync when online</span>}
               </div>
 
               <button
@@ -580,29 +741,6 @@ export default function TimeInOutPage() {
             </div>
           )}
 
-          {/* Employee roster */}
-          <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-            <div className="px-4 py-3 border-b border-gray-100">
-              <h2 className="text-sm font-semibold text-gray-700">Registered Employees</h2>
-            </div>
-            {employees.length === 0 ? (
-              <p className="p-3 text-xs text-gray-400 text-center">None</p>
-            ) : (
-              <ul className="divide-y divide-gray-50 max-h-60 overflow-y-auto">
-                {employees.map((e) => (
-                  <li key={e.id} className="px-4 py-2 flex items-center gap-2">
-                    <div className="w-6 h-6 rounded-full bg-brand-light flex items-center justify-center text-brand font-bold text-xs shrink-0">
-                      {e.name[0].toUpperCase()}
-                    </div>
-                    <div className="min-w-0">
-                      <span className="text-sm text-gray-700 font-medium truncate block">{e.name}</span>
-                      {e.uid && <span className="text-xs text-gray-400">{e.uid}</span>}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
         </div>
       </div>
     </div>

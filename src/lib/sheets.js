@@ -5,17 +5,18 @@
  * 1. Create a Google Sheet.
  * 2. Extensions → Apps Script → paste apps-script/Code.gs.
  * 3. Deploy as Web App (Execute as: Me, Who has access: Anyone).
- * 4. Copy the Web App URL and save it in Admin → Settings.
+ * 4. Paste the Web App URL into src/lib/config.js → APPS_SCRIPT_URL.
+ * 5. Rebuild the app (npm run build).
  */
 
-const STORAGE_KEY    = 'appsScriptUrl';
-const STD_HOURS_KEY  = 'standardWorkHours';
+import { APPS_SCRIPT_URL, APPS_SCRIPT_TOKEN } from './config.js';
 
-export function getAppsScriptUrl()    { return localStorage.getItem(STORAGE_KEY)   ?? ''; }
-export function saveAppsScriptUrl(url){ localStorage.setItem(STORAGE_KEY, url); }
+const STD_HOURS_KEY = 'standardWorkHours';
 
-export function getStandardHours()    { return Number(localStorage.getItem(STD_HOURS_KEY) ?? 8); }
-export function saveStandardHours(h)  { localStorage.setItem(STD_HOURS_KEY, String(h)); }
+export function getAppsScriptUrl() { return APPS_SCRIPT_URL; }
+
+export function getStandardHours()   { return Number(localStorage.getItem(STD_HOURS_KEY) ?? 8); }
+export function saveStandardHours(h) { localStorage.setItem(STD_HOURS_KEY, String(h)); }
 
 /** Duration string from two ISO timestamps → "Xh Ym". */
 export function calcDuration(timeIn, timeOut) {
@@ -39,7 +40,7 @@ export function calcDurationHours(timeIn, timeOut) {
 export async function pushLogToSheets(p) {
   const url = getAppsScriptUrl();
   if (!url) throw new Error('Apps Script URL not configured.');
-  const res = await fetch(url, { method: 'POST', body: JSON.stringify({ action: 'addLog', ...p }) });
+  const res = await fetch(url, { method: 'POST', body: JSON.stringify({ action: 'addLog', token: APPS_SCRIPT_TOKEN, ...p }) });
   if (!res.ok) throw new Error(`Sheets sync failed: ${res.status}`);
   return res.json();
 }
@@ -47,7 +48,7 @@ export async function pushLogToSheets(p) {
 export async function updateLogInSheets(p) {
   const url = getAppsScriptUrl();
   if (!url) throw new Error('Apps Script URL not configured.');
-  const res = await fetch(url, { method: 'POST', body: JSON.stringify({ action: 'updateLog', ...p }) });
+  const res = await fetch(url, { method: 'POST', body: JSON.stringify({ action: 'updateLog', token: APPS_SCRIPT_TOKEN, ...p }) });
   if (!res.ok) throw new Error(`Sheets update failed: ${res.status}`);
   return res.json();
 }
@@ -55,7 +56,7 @@ export async function updateLogInSheets(p) {
 export async function bulkPushLogsToSheets(logs) {
   const url = getAppsScriptUrl();
   if (!url) throw new Error('Apps Script URL not configured.');
-  const res = await fetch(url, { method: 'POST', body: JSON.stringify({ action: 'bulkAddLogs', logs }) });
+  const res = await fetch(url, { method: 'POST', body: JSON.stringify({ action: 'bulkAddLogs', token: APPS_SCRIPT_TOKEN, logs }) });
   if (!res.ok) throw new Error(`Bulk sync failed: ${res.status}`);
   return res.json();
 }
@@ -73,6 +74,7 @@ export async function upsertEmployeeToSheets(emp) {
     method: 'POST',
     body: JSON.stringify({
       action:      'upsertEmployee',
+      token:       APPS_SCRIPT_TOKEN,
       uid:         emp.uid         || '',
       name:        emp.name        || '',
       position:    emp.position    || '',
@@ -91,7 +93,7 @@ export async function upsertEmployeeToSheets(emp) {
 export async function fetchEmployeesFromSheets() {
   const url = getAppsScriptUrl();
   if (!url) throw new Error('Apps Script URL not configured.');
-  const res = await fetch(`${url}?action=getEmployees`);
+  const res = await fetch(`${url}?action=getEmployees&token=${APPS_SCRIPT_TOKEN}`);
   if (!res.ok) throw new Error(`Employee fetch failed: ${res.status}`);
   const data = await res.json();
   return data.employees || [];
@@ -106,7 +108,7 @@ export async function fetchEmployeesFromSheets() {
 export async function fetchBranchesFromSheets() {
   const url = getAppsScriptUrl();
   if (!url) throw new Error('Apps Script URL not configured.');
-  const res = await fetch(`${url}?action=getBranches`);
+  const res = await fetch(`${url}?action=getBranches&token=${APPS_SCRIPT_TOKEN}`);
   if (!res.ok) throw new Error(`Branch fetch failed: ${res.status}`);
   const data = await res.json();
   return data.branches || [];
@@ -121,7 +123,7 @@ export async function upsertBranchToSheets(branch) {
   if (!url) throw new Error('Apps Script URL not configured.');
   const res = await fetch(url, {
     method: 'POST',
-    body: JSON.stringify({ action: 'upsertBranch', code: branch.code, name: branch.name, pin: branch.pin || '' }),
+    body: JSON.stringify({ action: 'upsertBranch', token: APPS_SCRIPT_TOKEN, code: branch.code, name: branch.name, pin: branch.pin ?? '', isAdmin: branch.isAdmin ?? false }),
   });
   if (!res.ok) throw new Error(`Branch upsert failed: ${res.status}`);
   return res.json();
@@ -136,7 +138,7 @@ export async function deleteBranchFromSheets(code) {
   if (!url) throw new Error('Apps Script URL not configured.');
   const res = await fetch(url, {
     method: 'POST',
-    body: JSON.stringify({ action: 'deleteBranch', code }),
+    body: JSON.stringify({ action: 'deleteBranch', token: APPS_SCRIPT_TOKEN, code }),
   });
   if (!res.ok) throw new Error(`Branch delete failed: ${res.status}`);
   return res.json();
@@ -162,7 +164,7 @@ export async function bulkSyncEmployeesToSheets(employees) {
   }));
   const res = await fetch(url, {
     method: 'POST',
-    body: JSON.stringify({ action: 'bulkSyncEmployees', employees: payload }),
+    body: JSON.stringify({ action: 'bulkSyncEmployees', token: APPS_SCRIPT_TOKEN, employees: payload }),
   });
   if (!res.ok) throw new Error(`Employee sync failed: ${res.status}`);
   return res.json();
@@ -264,8 +266,26 @@ export async function generateMonthlySummaryToSheets(periodLabel, rows) {
   if (!url) throw new Error('Apps Script URL not configured.');
   const res = await fetch(url, {
     method: 'POST',
-    body: JSON.stringify({ action: 'generateMonthlySummary', period: periodLabel, rows }),
+    body: JSON.stringify({ action: 'generateMonthlySummary', token: APPS_SCRIPT_TOKEN, period: periodLabel, rows }),
   });
   if (!res.ok) throw new Error(`Monthly summary failed: ${res.status}`);
+  return res.json();
+}
+
+// ── Security: PIN hash migration ──────────────────────────────────────────────
+
+/**
+ * One-time server-side migration: hashes any plaintext PINs in the Branches sheet.
+ * Call once from Admin → Settings after deploying the updated Code.gs.
+ * Safe to run multiple times — already-hashed PINs are left untouched.
+ */
+export async function migratePinHashes() {
+  const url = getAppsScriptUrl();
+  if (!url) throw new Error('Apps Script URL not configured.');
+  const res = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify({ action: 'migratePinHashes', token: APPS_SCRIPT_TOKEN }),
+  });
+  if (!res.ok) throw new Error(`PIN migration failed: ${res.status}`);
   return res.json();
 }

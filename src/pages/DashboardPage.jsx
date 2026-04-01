@@ -3,10 +3,10 @@ import { useBranch } from '../context/BranchContext';
 import {
   getLogsByDate,
   getEmployee,
-  getAllBranches,
   getAllEmployees,
   todayDateString,
 } from '../lib/db';
+import { fetchBranchesFromSheets } from '../lib/sheets';
 
 // ── ElapsedTime: live running clock for present employees ────────────────────
 
@@ -236,11 +236,11 @@ function SuperAdminDashboard() {
     setLoading(true);
     try {
       const [branches, logs, emps] = await Promise.all([
-        getAllBranches(),
+        fetchBranchesFromSheets(),
         getLogsByDate(today),
         getAllEmployees(),
       ]);
-      setAllBranches(branches.filter((b) => b.code !== 'SUPER-ADMIN'));
+      setAllBranches(branches.filter((b) => !b.isAdmin));
       setAllLogs(logs);
       setEmployees(emps);
     } finally {
